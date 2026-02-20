@@ -4,8 +4,8 @@ GPU-accelerated cellular automata in Rust. Write cell behavior in a subset of Ru
 
 <table>
   <tr>
-    <td><img src="assets/gifs/cells.gif" width="400"></td>
-    <td><img src="assets/gifs/cells2.gif" width="400"></td>
+    <td><img src="assets/gifs/cells1.gif" width="49%"></td>
+    <td><img src="assets/gifs/cells2.gif" width="49%"></td>
   </tr>
 </table>
 
