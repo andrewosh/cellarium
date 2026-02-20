@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use wgpu::*;
 use winit::{
@@ -11,6 +11,7 @@ use winit::{
 
 use crate::pipeline::{self, Pipelines, Uniforms};
 use crate::texture::TextureState;
+use crate::tui::{self, SharedParams, ParamState};
 use crate::types::Cell;
 
 pub struct Simulation<T: Cell> {
@@ -61,9 +62,41 @@ impl<T: Cell> Simulation<T> {
 
     pub fn run(self) {
         env_logger::init();
+
+        let shared = Arc::new(Mutex::new(ParamState {
+            values: T::PARAM_DEFAULTS.to_vec(),
+            defaults: T::PARAM_DEFAULTS.to_vec(),
+            names: T::PARAM_NAMES.iter().map(|s| s.to_string()).collect(),
+            selected: 0,
+            title: self.title.clone(),
+            running: true,
+        }));
+
+        // Auto-load params from CLI arg if provided
+        for arg in std::env::args().skip(1) {
+            if arg.ends_with(".json") {
+                let mut state = shared.lock().unwrap();
+                match tui::load_params(&mut state, std::path::Path::new(&arg)) {
+                    Ok(()) => eprintln!("Loaded params from {}", arg),
+                    Err(e) => eprintln!("Failed to load {}: {}", arg, e),
+                }
+            }
+        }
+
+        let tui_handle = if !T::PARAM_DEFAULTS.is_empty() {
+            Some(tui::spawn(Arc::clone(&shared)))
+        } else {
+            None
+        };
+
         let event_loop = EventLoop::new().expect("Failed to create event loop");
-        let mut app = App::<T>::new(self);
+        let mut app = App::<T>::new(self, Arc::clone(&shared));
         event_loop.run_app(&mut app).expect("Event loop failed");
+
+        shared.lock().unwrap().running = false;
+        if let Some(h) = tui_handle {
+            let _ = h.join();
+        }
     }
 }
 
@@ -85,9 +118,8 @@ struct GpuState {
     viewport: [f32; 2],
     dragging: bool,
     last_mouse: [f32; 2],
-    params: Vec<f32>,
-    param_names: Vec<String>,
-    selected_param: usize,
+    shared_params: SharedParams,
+    param_count: usize,
 }
 
 impl GpuState {
@@ -100,21 +132,16 @@ impl GpuState {
             viewport: self.viewport,
         };
         self.queue.write_buffer(&self.uniform_buffer, 0, bytemuck::bytes_of(&header));
-        if !self.params.is_empty() {
-            let vec4_count = (self.params.len() + 3) / 4;
+        if self.param_count > 0 {
+            let state = self.shared_params.lock().unwrap();
+            let vec4_count = (state.values.len() + 3) / 4;
             let mut padded = vec![0.0f32; vec4_count * 4];
-            for (i, &v) in self.params.iter().enumerate() {
+            for (i, &v) in state.values.iter().enumerate() {
                 padded[i] = v;
             }
             let offset = std::mem::size_of::<Uniforms>() as u64;
             self.queue.write_buffer(&self.uniform_buffer, offset, bytemuck::cast_slice(&padded));
         }
-    }
-
-    fn print_param(&self) {
-        if self.params.is_empty() { return; }
-        let i = self.selected_param;
-        eprintln!("[{}] {} = {:.6}", i, self.param_names[i], self.params[i]);
     }
 
     fn run_tick(&mut self) {
@@ -186,7 +213,6 @@ impl GpuState {
 
         let surface_view = output.texture.create_view(&TextureViewDescriptor::default());
 
-        // Update uniforms for view pass
         self.write_uniforms(self.tick);
 
         let mut encoder = self.device.create_command_encoder(&CommandEncoderDescriptor {
@@ -239,7 +265,6 @@ impl GpuState {
 
         self.write_uniforms(0);
 
-        // Init shader writes to textures_a
         let mut encoder = self.device.create_command_encoder(&CommandEncoderDescriptor {
             label: Some("init_encoder"),
         });
@@ -253,7 +278,6 @@ impl GpuState {
             }],
         });
 
-        // Write to both A and B textures
         for textures in [&self.textures.views_a, &self.textures.views_b] {
             let color_attachments: Vec<Option<RenderPassColorAttachment>> = textures.iter()
                 .map(|view| Some(RenderPassColorAttachment {
@@ -299,14 +323,16 @@ impl GpuState {
 
 struct App<T: Cell> {
     config: Simulation<T>,
+    shared_params: SharedParams,
     window: Option<Arc<Window>>,
     gpu: Option<GpuState>,
 }
 
 impl<T: Cell> App<T> {
-    fn new(config: Simulation<T>) -> Self {
+    fn new(config: Simulation<T>, shared_params: SharedParams) -> Self {
         Self {
             config,
+            shared_params,
             window: None,
             gpu: None,
         }
@@ -331,6 +357,9 @@ impl<T: Cell> ApplicationHandler for App<T> {
 
         let window = Arc::new(event_loop.create_window(attrs).expect("Failed to create window"));
         self.window = Some(window.clone());
+
+        let shared_params = Arc::clone(&self.shared_params);
+        let param_count = T::PARAM_DEFAULTS.len();
 
         // Initialize wgpu
         let gpu = pollster::block_on(async {
@@ -390,7 +419,7 @@ impl<T: Cell> ApplicationHandler for App<T> {
 
             let uniform_buffer = device.create_buffer(&BufferDescriptor {
                 label: Some("uniforms"),
-                size: pipeline::uniform_buffer_size(T::PARAM_DEFAULTS.len()),
+                size: pipeline::uniform_buffer_size(param_count),
                 usage: BufferUsages::UNIFORM | BufferUsages::COPY_DST,
                 mapped_at_creation: false,
             });
@@ -398,9 +427,6 @@ impl<T: Cell> ApplicationHandler for App<T> {
             let viewport = [size.width as f32, size.height as f32];
             let default_zoom = (size.width as f32 / self.config.width as f32)
                 .min(size.height as f32 / self.config.height as f32);
-
-            let params: Vec<f32> = T::PARAM_DEFAULTS.to_vec();
-            let param_names: Vec<String> = T::PARAM_NAMES.iter().map(|s| s.to_string()).collect();
 
             let mut gpu = GpuState {
                 device,
@@ -420,9 +446,8 @@ impl<T: Cell> ApplicationHandler for App<T> {
                 viewport,
                 dragging: false,
                 last_mouse: [0.0, 0.0],
-                params,
-                param_names,
-                selected_param: 0,
+                shared_params,
+                param_count,
             };
 
             // Initialize state
@@ -462,12 +487,6 @@ impl<T: Cell> ApplicationHandler for App<T> {
                         gpu.paused = !gpu.paused;
                         window.request_redraw();
                     }
-                    KeyCode::ArrowRight => {
-                        if gpu.paused {
-                            gpu.run_tick();
-                            window.request_redraw();
-                        }
-                    }
                     KeyCode::Equal => {
                         gpu.ticks_per_frame = (gpu.ticks_per_frame + 1).min(64);
                     }
@@ -478,22 +497,48 @@ impl<T: Cell> ApplicationHandler for App<T> {
                         gpu.reset::<T>();
                         window.request_redraw();
                     }
-                    KeyCode::Tab => {
-                        if !gpu.params.is_empty() {
-                            gpu.selected_param = (gpu.selected_param + 1) % gpu.params.len();
-                            gpu.print_param();
+                    KeyCode::ArrowUp => {
+                        let mut state = gpu.shared_params.lock().unwrap();
+                        if !state.values.is_empty() && state.selected > 0 {
+                            state.selected -= 1;
                         }
                     }
-                    KeyCode::BracketLeft => {
-                        if !gpu.params.is_empty() {
-                            gpu.params[gpu.selected_param] /= 1.05;
-                            gpu.print_param();
+                    KeyCode::ArrowDown => {
+                        let mut state = gpu.shared_params.lock().unwrap();
+                        if !state.values.is_empty() && state.selected + 1 < state.values.len() {
+                            state.selected += 1;
                         }
                     }
-                    KeyCode::BracketRight => {
-                        if !gpu.params.is_empty() {
-                            gpu.params[gpu.selected_param] *= 1.05;
-                            gpu.print_param();
+                    KeyCode::ArrowLeft => {
+                        let mut state = gpu.shared_params.lock().unwrap();
+                        if !state.values.is_empty() {
+                            let i = state.selected;
+                            state.values[i] /= 1.05;
+                        }
+                    }
+                    KeyCode::ArrowRight => {
+                        let mut state = gpu.shared_params.lock().unwrap();
+                        if !state.values.is_empty() {
+                            let i = state.selected;
+                            state.values[i] *= 1.05;
+                        } else if gpu.paused {
+                            drop(state);
+                            gpu.run_tick();
+                            window.request_redraw();
+                        }
+                    }
+                    KeyCode::KeyD => {
+                        let mut state = gpu.shared_params.lock().unwrap();
+                        if !state.values.is_empty() {
+                            let i = state.selected;
+                            state.values[i] = state.defaults[i];
+                        }
+                    }
+                    KeyCode::KeyS => {
+                        let state = gpu.shared_params.lock().unwrap();
+                        match tui::save_params(&state) {
+                            Ok(path) => eprintln!("Saved to {}", path),
+                            Err(e) => eprintln!("Save failed: {}", e),
                         }
                     }
                     _ => {}

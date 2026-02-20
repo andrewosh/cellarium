@@ -2,6 +2,7 @@ pub mod types;
 pub mod runtime;
 pub mod texture;
 pub mod pipeline;
+pub mod tui;
 
 pub use cellarium_macros::{CellState, cell};
 
