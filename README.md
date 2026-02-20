@@ -2,7 +2,8 @@
 
 GPU-accelerated cellular automata in Rust. Write cell behavior in a subset of Rust; a proc macro cross-compiles it to WGSL shaders that run entirely on the GPU via wgpu.
 
-![Cellarium](assets/cells.gif)
+![Cellarium](assets/gifs/cells.gif)
+![Cellarium](assets/gifs/cells2.gif)
 
 ## Quick Start
 
