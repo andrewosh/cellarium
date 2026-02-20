@@ -2,10 +2,14 @@
 
 GPU-accelerated cellular automata in Rust. Write cell behavior in a subset of Rust; a proc macro cross-compiles it to WGSL shaders that run entirely on the GPU via wgpu.
 
-<table>
+<table cellspacing="0" cellpadding="0">
   <tr>
-    <td><img src="assets/gifs/cells1.gif" width="49%"></td>
-    <td><img src="assets/gifs/cells2.gif" width="49%"></td>
+    <td><img src="assets/gifs/cells1.gif"></td>
+    <td><img src="assets/gifs/cells2.gif"></td>
+  </tr>
+  <tr>
+    <td><img src="assets/gifs/cells3.gif"></td>
+    <td><img src="assets/gifs/cells4.gif"></td>
   </tr>
 </table>
 
