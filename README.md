@@ -1,4 +1,5 @@
 # Cellarium
+*Note: This is a 100% vibe-coded experiment*
 
 GPU-accelerated cellular automata in Rust. Write cell behavior in a subset of Rust; a proc macro cross-compiles it to WGSL shaders that run entirely on the GPU via wgpu.
 
