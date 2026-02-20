@@ -17,6 +17,13 @@ use ratatui::{
     prelude::CrosstermBackend, Terminal,
 };
 
+#[derive(Clone)]
+pub struct ParamChange {
+    pub tick: u32,
+    pub param: String,
+    pub value: f32,
+}
+
 pub struct ParamState {
     pub values: Vec<f32>,
     pub defaults: Vec<f32>,
@@ -24,16 +31,62 @@ pub struct ParamState {
     pub selected: usize,
     pub title: String,
     pub running: bool,
+    pub tick: u32,
+    pub history: Vec<ParamChange>,
+    pub replay: Vec<ParamChange>,
+    pub replay_cursor: usize,
+}
+
+impl ParamState {
+    pub fn set_param(&mut self, idx: usize, value: f32) {
+        self.values[idx] = value;
+        if self.replay.is_empty() {
+            self.history.push(ParamChange {
+                tick: self.tick,
+                param: self.names[idx].clone(),
+                value,
+            });
+        }
+    }
+
+    pub fn apply_pending_replay(&mut self) {
+        while self.replay_cursor < self.replay.len()
+            && self.replay[self.replay_cursor].tick <= self.tick
+        {
+            let change = self.replay[self.replay_cursor].clone();
+            if let Some(idx) = self.names.iter().position(|n| n == &change.param) {
+                self.values[idx] = change.value;
+            }
+            self.replay_cursor += 1;
+        }
+    }
+
+    pub fn clear_history(&mut self) {
+        self.history.clear();
+        self.replay.clear();
+        self.replay_cursor = 0;
+    }
+
+    pub fn is_replaying(&self) -> bool {
+        !self.replay.is_empty()
+    }
 }
 
 pub type SharedParams = Arc<Mutex<ParamState>>;
 
 pub fn save_params(state: &ParamState) -> io::Result<String> {
-    let mut entries: Vec<String> = Vec::new();
-    for (name, &val) in state.names.iter().zip(state.values.iter()) {
-        entries.push(format!("  \"{}\": {}", name, val));
+    let mut initial_entries: Vec<String> = Vec::new();
+    for (name, &val) in state.names.iter().zip(state.defaults.iter()) {
+        initial_entries.push(format!("    \"{}\": {}", name, val));
     }
-    let json = format!("{{\n{}\n}}", entries.join(",\n"));
+    let initial = format!("{{\n{}\n  }}", initial_entries.join(",\n"));
+
+    let history_entries: Vec<String> = state.history.iter().map(|c| {
+        format!("    {{\"tick\": {}, \"param\": \"{}\", \"value\": {}}}", c.tick, c.param, c.value)
+    }).collect();
+    let history = format!("[\n{}\n  ]", history_entries.join(",\n"));
+
+    let json = format!("{{\n  \"initial\": {},\n  \"history\": {}\n}}", initial, history);
 
     let filename = format!("{}_params.json", state.title.to_lowercase().replace(' ', "_"));
     std::fs::write(&filename, &json)?;
@@ -45,11 +98,41 @@ pub fn load_params(state: &mut ParamState, path: &Path) -> io::Result<()> {
     let parsed: serde_json::Value = serde_json::from_str(&contents)
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
 
-    if let serde_json::Value::Object(map) = parsed {
-        for (name, val) in &map {
-            if let Some(idx) = state.names.iter().position(|n| n == name) {
-                if let Some(v) = val.as_f64() {
-                    state.values[idx] = v as f32;
+    if let serde_json::Value::Object(ref map) = parsed {
+        // New format with initial + history
+        if let Some(serde_json::Value::Object(initial)) = map.get("initial") {
+            for (name, val) in initial {
+                if let Some(idx) = state.names.iter().position(|n| n == name) {
+                    if let Some(v) = val.as_f64() {
+                        state.values[idx] = v as f32;
+                    }
+                }
+            }
+
+            if let Some(serde_json::Value::Array(history)) = map.get("history") {
+                state.replay.clear();
+                state.replay_cursor = 0;
+                for entry in history {
+                    if let (Some(tick), Some(param), Some(value)) = (
+                        entry.get("tick").and_then(|t| t.as_u64()),
+                        entry.get("param").and_then(|p| p.as_str()),
+                        entry.get("value").and_then(|v| v.as_f64()),
+                    ) {
+                        state.replay.push(ParamChange {
+                            tick: tick as u32,
+                            param: param.to_string(),
+                            value: value as f32,
+                        });
+                    }
+                }
+            }
+        } else {
+            // Legacy flat format: {"NAME": value, ...}
+            for (name, val) in map {
+                if let Some(idx) = state.names.iter().position(|n| n == name) {
+                    if let Some(v) = val.as_f64() {
+                        state.values[idx] = v as f32;
+                    }
                 }
             }
         }
@@ -115,15 +198,18 @@ fn run_tui(shared: &SharedParams) -> io::Result<()> {
                     }
                     KeyCode::Left => {
                         let i = state.selected;
-                        state.values[i] /= factor as f32;
+                        let new_val = state.values[i] / factor as f32;
+                        state.set_param(i, new_val);
                     }
                     KeyCode::Right => {
                         let i = state.selected;
-                        state.values[i] *= factor as f32;
+                        let new_val = state.values[i] * factor as f32;
+                        state.set_param(i, new_val);
                     }
                     KeyCode::Char('d') => {
                         let i = state.selected;
-                        state.values[i] = state.defaults[i];
+                        let default = state.defaults[i];
+                        state.set_param(i, default);
                     }
                     KeyCode::Char('s') => {
                         match save_params(&state) {
@@ -164,9 +250,14 @@ fn draw_ui(f: &mut ratatui::Frame, state: &ParamState) {
         .collect();
 
     let param_area = chunks[0];
+    let title = if state.is_replaying() {
+        format!(" {} — Parameters [REPLAY] ", state.title)
+    } else {
+        format!(" {} — Parameters ", state.title)
+    };
     let param_block = Block::default()
         .borders(Borders::ALL)
-        .title(format!(" {} — Parameters ", state.title));
+        .title(title);
     let inner = param_block.inner(param_area);
     f.render_widget(param_block, param_area);
 
@@ -237,7 +328,8 @@ fn draw_ui(f: &mut ratatui::Frame, state: &ParamState) {
     }
 
     // Footer
-    let help = Line::from(vec![
+    let change_count = state.history.len();
+    let mut help_spans = vec![
         Span::styled("↑↓", Style::default().fg(Color::Yellow)),
         Span::raw(" select  "),
         Span::styled("←→", Style::default().fg(Color::Yellow)),
@@ -246,9 +338,19 @@ fn draw_ui(f: &mut ratatui::Frame, state: &ParamState) {
         Span::raw(" coarse  "),
         Span::styled("d", Style::default().fg(Color::Yellow)),
         Span::raw(" reset  "),
+        Span::styled("s", Style::default().fg(Color::Yellow)),
+        Span::raw(" save  "),
         Span::styled("q", Style::default().fg(Color::Yellow)),
         Span::raw(" quit"),
-    ]);
+    ];
+    if change_count > 0 {
+        help_spans.push(Span::raw("  "));
+        help_spans.push(Span::styled(
+            format!("[{} changes]", change_count),
+            Style::default().fg(Color::DarkGray),
+        ));
+    }
+    let help = Line::from(help_spans);
     let footer = Paragraph::new(help)
         .block(Block::default().borders(Borders::ALL));
     f.render_widget(footer, chunks[1]);

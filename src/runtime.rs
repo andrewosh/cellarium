@@ -70,6 +70,10 @@ impl<T: Cell> Simulation<T> {
             selected: 0,
             title: self.title.clone(),
             running: true,
+            tick: 0,
+            history: Vec::new(),
+            replay: Vec::new(),
+            replay_cursor: 0,
         }));
 
         // Auto-load params from CLI arg if provided
@@ -133,7 +137,9 @@ impl GpuState {
         };
         self.queue.write_buffer(&self.uniform_buffer, 0, bytemuck::bytes_of(&header));
         if self.param_count > 0 {
-            let state = self.shared_params.lock().unwrap();
+            let mut state = self.shared_params.lock().unwrap();
+            state.tick = tick;
+            state.apply_pending_replay();
             let vec4_count = (state.values.len() + 3) / 4;
             let mut padded = vec![0.0f32; vec4_count * 4];
             for (i, &v) in state.values.iter().enumerate() {
@@ -494,6 +500,11 @@ impl<T: Cell> ApplicationHandler for App<T> {
                         gpu.ticks_per_frame = gpu.ticks_per_frame.saturating_sub(1).max(1);
                     }
                     KeyCode::KeyR => {
+                        {
+                            let mut state = gpu.shared_params.lock().unwrap();
+                            state.values = state.defaults.clone();
+                            state.clear_history();
+                        }
                         gpu.reset::<T>();
                         window.request_redraw();
                     }
@@ -513,14 +524,16 @@ impl<T: Cell> ApplicationHandler for App<T> {
                         let mut state = gpu.shared_params.lock().unwrap();
                         if !state.values.is_empty() {
                             let i = state.selected;
-                            state.values[i] /= 1.05;
+                            let new_val = state.values[i] / 1.05;
+                            state.set_param(i, new_val);
                         }
                     }
                     KeyCode::ArrowRight => {
                         let mut state = gpu.shared_params.lock().unwrap();
                         if !state.values.is_empty() {
                             let i = state.selected;
-                            state.values[i] *= 1.05;
+                            let new_val = state.values[i] * 1.05;
+                            state.set_param(i, new_val);
                         } else if gpu.paused {
                             drop(state);
                             gpu.run_tick();
@@ -531,7 +544,8 @@ impl<T: Cell> ApplicationHandler for App<T> {
                         let mut state = gpu.shared_params.lock().unwrap();
                         if !state.values.is_empty() {
                             let i = state.selected;
-                            state.values[i] = state.defaults[i];
+                            let default = state.defaults[i];
+                            state.set_param(i, default);
                         }
                     }
                     KeyCode::KeyS => {
