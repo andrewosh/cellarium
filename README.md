@@ -303,6 +303,7 @@ cargo run --example rock_paper_scissors
 cargo run --example erosion
 cargo run --example sandpile
 cargo run --example cascade
+cargo run --example fitzhugh_nagumo
 ```
 
 ## License

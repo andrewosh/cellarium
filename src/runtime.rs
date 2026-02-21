@@ -11,7 +11,7 @@ use winit::{
 
 use crate::pipeline::{self, Pipelines, Uniforms};
 use crate::texture::TextureState;
-use crate::tui::{self, SharedParams, ParamState};
+use crate::tui::{self, SharedParams, ParamState, ReplayAction};
 use crate::types::Cell;
 
 pub struct Simulation<T: Cell> {
@@ -138,9 +138,7 @@ impl GpuState {
         };
         self.queue.write_buffer(&self.uniform_buffer, 0, bytemuck::bytes_of(&header));
         if self.param_count > 0 {
-            let mut state = self.shared_params.lock().unwrap();
-            state.tick = tick;
-            state.apply_pending_replay();
+            let state = self.shared_params.lock().unwrap();
             let vec4_count = (state.values.len() + 3) / 4;
             let mut padded = vec![0.0f32; vec4_count * 4];
             for (i, &v) in state.values.iter().enumerate() {
@@ -326,6 +324,13 @@ impl GpuState {
             self.textures.write_defaults(&self.queue, &defaults);
         }
     }
+
+    fn resize_grid<T: Cell>(&mut self, new_width: u32, new_height: u32) {
+        self.textures = TextureState::new(&self.device, new_width, new_height, self.texture_count);
+        self.default_zoom = (self.viewport[0] / new_width as f32)
+            .min(self.viewport[1] / new_height as f32);
+        self.reset::<T>();
+    }
 }
 
 struct App<T: Cell> {
@@ -503,11 +508,34 @@ impl<T: Cell> ApplicationHandler for App<T> {
                     KeyCode::Minus => {
                         gpu.ticks_per_frame = gpu.ticks_per_frame.saturating_sub(1).max(1);
                     }
+                    KeyCode::BracketRight => {
+                        let w = gpu.textures.width + 128;
+                        let h = gpu.textures.height + 128;
+                        {
+                            let mut state = gpu.shared_params.lock().unwrap();
+                            state.record_resize(w, h);
+                        }
+                        gpu.resize_grid::<T>(w, h);
+                        eprintln!("Grid: {}x{}", w, h);
+                        window.request_redraw();
+                    }
+                    KeyCode::BracketLeft => {
+                        let w = gpu.textures.width.saturating_sub(128).max(128);
+                        let h = gpu.textures.height.saturating_sub(128).max(128);
+                        if w != gpu.textures.width {
+                            {
+                                let mut state = gpu.shared_params.lock().unwrap();
+                                state.record_resize(w, h);
+                            }
+                            gpu.resize_grid::<T>(w, h);
+                            eprintln!("Grid: {}x{}", w, h);
+                            window.request_redraw();
+                        }
+                    }
                     KeyCode::KeyR => {
                         {
                             let mut state = gpu.shared_params.lock().unwrap();
-                            state.values = state.defaults.clone();
-                            state.clear_history();
+                            state.record_reset();
                         }
                         gpu.reset::<T>();
                         window.request_redraw();
@@ -547,9 +575,10 @@ impl<T: Cell> ApplicationHandler for App<T> {
                     KeyCode::KeyD => {
                         let mut state = gpu.shared_params.lock().unwrap();
                         if !state.values.is_empty() {
-                            let i = state.selected;
-                            let default = state.defaults[i];
-                            state.set_param(i, default);
+                            for i in 0..state.values.len() {
+                                let default = state.defaults[i];
+                                state.set_param(i, default);
+                            }
                         }
                     }
                     KeyCode::KeyS => {
@@ -601,6 +630,24 @@ impl<T: Cell> ApplicationHandler for App<T> {
             WindowEvent::RedrawRequested => {
                 if !gpu.paused {
                     for _ in 0..gpu.ticks_per_frame {
+                        // Sync tick and apply pending replay events
+                        if gpu.param_count > 0 {
+                            let mut state = gpu.shared_params.lock().unwrap();
+                            state.tick = gpu.tick;
+                            match state.apply_pending_replay() {
+                                ReplayAction::Reset => {
+                                    drop(state);
+                                    gpu.reset::<T>();
+                                    continue;
+                                }
+                                ReplayAction::Resize(w, h) => {
+                                    drop(state);
+                                    gpu.resize_grid::<T>(w, h);
+                                    continue;
+                                }
+                                ReplayAction::None => {}
+                            }
+                        }
                         gpu.run_tick();
                     }
                 }

@@ -37,6 +37,16 @@ pub struct ParamState {
     pub replay_cursor: usize,
 }
 
+pub enum ReplayAction {
+    None,
+    Reset,
+    Resize(u32, u32),
+}
+
+pub const RESET_MARKER: &str = "__reset__";
+pub const RESIZE_W_MARKER: &str = "__resize_w__";
+pub const RESIZE_H_MARKER: &str = "__resize_h__";
+
 impl ParamState {
     pub fn set_param(&mut self, idx: usize, value: f32) {
         self.values[idx] = value;
@@ -49,16 +59,55 @@ impl ParamState {
         }
     }
 
-    pub fn apply_pending_replay(&mut self) {
+    pub fn record_reset(&mut self) {
+        if self.replay.is_empty() {
+            self.history.push(ParamChange {
+                tick: self.tick,
+                param: RESET_MARKER.to_string(),
+                value: 0.0,
+            });
+        }
+    }
+
+    pub fn record_resize(&mut self, width: u32, height: u32) {
+        if self.replay.is_empty() {
+            self.history.push(ParamChange {
+                tick: self.tick,
+                param: RESIZE_W_MARKER.to_string(),
+                value: width as f32,
+            });
+            self.history.push(ParamChange {
+                tick: self.tick,
+                param: RESIZE_H_MARKER.to_string(),
+                value: height as f32,
+            });
+        }
+    }
+
+    /// Returns any pending actions (reset, resize) that the caller must perform.
+    pub fn apply_pending_replay(&mut self) -> ReplayAction {
+        let mut action = ReplayAction::None;
+        let mut resize_w: Option<u32> = None;
+        let mut resize_h: Option<u32> = None;
         while self.replay_cursor < self.replay.len()
             && self.replay[self.replay_cursor].tick <= self.tick
         {
             let change = self.replay[self.replay_cursor].clone();
-            if let Some(idx) = self.names.iter().position(|n| n == &change.param) {
+            if change.param == RESET_MARKER {
+                action = ReplayAction::Reset;
+            } else if change.param == RESIZE_W_MARKER {
+                resize_w = Some(change.value as u32);
+            } else if change.param == RESIZE_H_MARKER {
+                resize_h = Some(change.value as u32);
+            } else if let Some(idx) = self.names.iter().position(|n| n == &change.param) {
                 self.values[idx] = change.value;
             }
             self.replay_cursor += 1;
         }
+        if let (Some(w), Some(h)) = (resize_w, resize_h) {
+            action = ReplayAction::Resize(w, h);
+        }
+        action
     }
 
     pub fn clear_history(&mut self) {
@@ -207,9 +256,10 @@ fn run_tui(shared: &SharedParams) -> io::Result<()> {
                         state.set_param(i, new_val);
                     }
                     KeyCode::Char('d') => {
-                        let i = state.selected;
-                        let default = state.defaults[i];
-                        state.set_param(i, default);
+                        for i in 0..state.values.len() {
+                            let default = state.defaults[i];
+                            state.set_param(i, default);
+                        }
                     }
                     KeyCode::Char('s') => {
                         match save_params(&state) {
