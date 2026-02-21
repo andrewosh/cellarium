@@ -182,8 +182,8 @@ fn run_tui(shared: &SharedParams) -> io::Result<()> {
                     continue;
                 }
 
-                let coarse = key.modifiers.contains(KeyModifiers::SHIFT);
-                let factor = if coarse { 1.2 } else { 1.05 };
+                let fine = key.modifiers.contains(KeyModifiers::SHIFT);
+                let factor = if fine { 1.00625 } else { 1.05 };
 
                 match key.code {
                     KeyCode::Up => {
@@ -335,7 +335,7 @@ fn draw_ui(f: &mut ratatui::Frame, state: &ParamState) {
         Span::styled("←→", Style::default().fg(Color::Yellow)),
         Span::raw(" adjust  "),
         Span::styled("shift+←→", Style::default().fg(Color::Yellow)),
-        Span::raw(" coarse  "),
+        Span::raw(" fine  "),
         Span::styled("d", Style::default().fg(Color::Yellow)),
         Span::raw(" reset  "),
         Span::styled("s", Style::default().fg(Color::Yellow)),

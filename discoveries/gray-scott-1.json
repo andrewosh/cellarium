@@ -1,0 +1,18 @@
+{
+  "initial": {
+    "DA": 0.21,
+    "DB": 0.105,
+    "FEED": 0.026,
+    "KILL": 0.052
+  },
+  "history": [
+    {"tick": 512, "param": "KILL", "value": 0.0546},
+    {"tick": 928, "param": "KILL", "value": 0.057329997},
+    {"tick": 2112, "param": "FEED", "value": 0.024761906},
+    {"tick": 2272, "param": "FEED", "value": 0.023582768},
+    {"tick": 2464, "param": "FEED", "value": 0.022459779},
+    {"tick": 3584, "param": "FEED", "value": 0.021390267},
+    {"tick": 8128, "param": "DB", "value": 0.11024999},
+    {"tick": 8192, "param": "DB", "value": 0.11576248}
+  ]
+}

@@ -122,6 +122,7 @@ struct GpuState {
     viewport: [f32; 2],
     dragging: bool,
     last_mouse: [f32; 2],
+    shift_held: bool,
     shared_params: SharedParams,
     param_count: usize,
 }
@@ -452,6 +453,7 @@ impl<T: Cell> ApplicationHandler for App<T> {
                 viewport,
                 dragging: false,
                 last_mouse: [0.0, 0.0],
+                shift_held: false,
                 shared_params,
                 param_count,
             };
@@ -485,8 +487,10 @@ impl<T: Cell> ApplicationHandler for App<T> {
                     state: ElementState::Pressed,
                     ..
                 },
+                is_synthetic: false,
                 ..
             } => {
+                let factor: f32 = if gpu.shift_held { 1.00625 } else { 1.05 };
                 match key {
                     KeyCode::Escape => event_loop.exit(),
                     KeyCode::Space => {
@@ -524,7 +528,7 @@ impl<T: Cell> ApplicationHandler for App<T> {
                         let mut state = gpu.shared_params.lock().unwrap();
                         if !state.values.is_empty() {
                             let i = state.selected;
-                            let new_val = state.values[i] / 1.05;
+                            let new_val = state.values[i] / factor;
                             state.set_param(i, new_val);
                         }
                     }
@@ -532,7 +536,7 @@ impl<T: Cell> ApplicationHandler for App<T> {
                         let mut state = gpu.shared_params.lock().unwrap();
                         if !state.values.is_empty() {
                             let i = state.selected;
-                            let new_val = state.values[i] * 1.05;
+                            let new_val = state.values[i] * factor;
                             state.set_param(i, new_val);
                         } else if gpu.paused {
                             drop(state);
@@ -557,6 +561,9 @@ impl<T: Cell> ApplicationHandler for App<T> {
                     }
                     _ => {}
                 }
+            }
+            WindowEvent::ModifiersChanged(modifiers) => {
+                gpu.shift_held = modifiers.state().shift_key();
             }
             WindowEvent::PinchGesture { delta, .. } => {
                 gpu.zoom *= 1.0 + delta as f32;
