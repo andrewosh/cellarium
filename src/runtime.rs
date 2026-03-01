@@ -116,6 +116,7 @@ struct GpuState {
     ticks_per_frame: u32,
     paused: bool,
     texture_count: u32,
+    tile_size: u32,
     zoom: f32,
     default_zoom: f32,
     camera: [f32; 2],
@@ -156,45 +157,36 @@ impl GpuState {
             label: Some("sim_encoder"),
         });
 
-        // Simulation pass — read from current, write to other
+        // Simulation pass — compute shader reads from current, writes to other
         {
             let read_views = self.textures.read_views();
             let write_views = self.textures.write_views();
 
             let bind_group = {
-                let view_refs: Vec<&TextureView> = read_views.iter().collect();
-                pipeline::create_bind_group(
+                let read_refs: Vec<&TextureView> = read_views.iter().collect();
+                let write_refs: Vec<&TextureView> = write_views.iter().collect();
+                pipeline::create_compute_bind_group(
                     &self.device,
                     &self.pipelines.sim_bind_group_layout,
-                    &view_refs,
+                    &read_refs,
+                    &write_refs,
                     &self.uniform_buffer,
                     self.texture_count,
                 )
             };
 
-            let color_attachments: Vec<Option<RenderPassColorAttachment>> = write_views.iter()
-                .map(|view| Some(RenderPassColorAttachment {
-                    view,
-                    depth_slice: None,
-                    resolve_target: None,
-                    ops: Operations {
-                        load: LoadOp::Clear(Color::BLACK),
-                        store: StoreOp::Store,
-                    },
-                }))
-                .collect();
-
-            let mut pass = encoder.begin_render_pass(&RenderPassDescriptor {
-                label: Some("sim_pass"),
-                color_attachments: &color_attachments,
-                depth_stencil_attachment: None,
+            let mut pass = encoder.begin_compute_pass(&ComputePassDescriptor {
+                label: Some("sim_compute_pass"),
                 timestamp_writes: None,
-                occlusion_query_set: None,
-                multiview_mask: None,
             });
             pass.set_pipeline(&self.pipelines.sim_pipeline);
             pass.set_bind_group(0, &bind_group, &[]);
-            pass.draw(0..3, 0..1);
+
+            // Dispatch workgroups to cover the entire grid
+            let ts = self.tile_size;
+            let wg_x = (self.textures.width + ts - 1) / ts;
+            let wg_y = (self.textures.height + ts - 1) / ts;
+            pass.dispatch_workgroups(wg_x, wg_y, 1);
         }
 
         self.queue.submit(std::iter::once(encoder.finish()));
@@ -452,6 +444,7 @@ impl<T: Cell> ApplicationHandler for App<T> {
                 ticks_per_frame: self.config.ticks_per_frame,
                 paused: self.config.paused,
                 texture_count,
+                tile_size: T::TILE_SIZE,
                 zoom: default_zoom,
                 default_zoom,
                 camera: [self.config.width as f32 / 2.0, self.config.height as f32 / 2.0],

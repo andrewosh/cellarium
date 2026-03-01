@@ -48,8 +48,8 @@ impl Cell for Wave {
 
     fn view(self) -> Color {
         // Bright wavefronts on dark background — peaks are warm, troughs are cool
-        let amp = (self.height * 4.0).clamp(-1.0, 1.0);
-        Color::hsv(0.6 - amp * 0.15, 0.7, 0.1 + amp * amp * 0.9)
+        let amp = (self.height * 12.0).clamp(-1.0, 1.0);
+        Color::hsv(0.6 - amp * 0.15, 0.6, 0.5 + amp * amp * 0.5)
     }
 }
 

@@ -127,6 +127,11 @@ pub fn cell_impl(attr: TokenStream, item: TokenStream) -> Result<TokenStream> {
         (false, String::new())
     };
 
+    // Compute tile size for the runtime dispatch
+    let num_textures = ((info.fields.len() + 3) / 4).max(1) as u32;
+    let (tile_size, _use_shared) = lower::compute_tile_config(info.neighborhood.radius(), num_textures);
+    let tile_size_lit = tile_size;
+
     let param_names: Vec<String> = constants.iter().map(|c| c.name.clone()).collect();
     let param_name_lits: Vec<syn::LitStr> = param_names.iter()
         .map(|n| syn::LitStr::new(n, proc_macro2::Span::call_site()))
@@ -141,6 +146,7 @@ pub fn cell_impl(attr: TokenStream, item: TokenStream) -> Result<TokenStream> {
             const HAS_INIT: bool = #has_init;
             const PARAM_NAMES: &'static [&'static str] = &[#(#param_name_lits),*];
             const PARAM_DEFAULTS: &'static [f32] = &[#(#param_defaults as f32),*];
+            const TILE_SIZE: u32 = #tile_size_lit;
         }
     })
 }

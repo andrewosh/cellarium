@@ -400,4 +400,5 @@ pub trait Cell: CellState {
     const HAS_INIT: bool;
     const PARAM_NAMES: &'static [&'static str];
     const PARAM_DEFAULTS: &'static [f32];
+    const TILE_SIZE: u32;
 }

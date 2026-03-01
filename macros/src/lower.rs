@@ -285,6 +285,8 @@ struct EmitCtx<'a> {
     body: Vec<String>,
     output_lines: Vec<String>,
     self_fields_fetched: HashSet<String>,
+    compute_mode: bool,
+    use_shared: bool,
 }
 
 impl<'a> EmitCtx<'a> {
@@ -296,6 +298,8 @@ impl<'a> EmitCtx<'a> {
             body: Vec::new(),
             output_lines: Vec::new(),
             self_fields_fetched: HashSet::new(),
+            compute_mode: false,
+            use_shared: false,
         }
     }
 
@@ -310,10 +314,17 @@ impl<'a> EmitCtx<'a> {
         if !self.self_fields_fetched.contains(field_name) {
             self.self_fields_fetched.insert(field_name.to_string());
             let (tex, swizzle) = self.field_texture_swizzle(field_name);
-            self.preamble.push(format!(
-                "    let {} = textureLoad(state_tex{}, cell_coord, 0).{};",
-                var_name, tex, swizzle
-            ));
+            if self.compute_mode && self.use_shared {
+                self.preamble.push(format!(
+                    "    let {} = shared_tex{}[ly * PADDED + lx].{};",
+                    var_name, tex, swizzle
+                ));
+            } else {
+                self.preamble.push(format!(
+                    "    let {} = textureLoad(state_tex{}, cell_coord, 0).{};",
+                    var_name, tex, swizzle
+                ));
+            }
         }
         var_name
     }
@@ -708,10 +719,17 @@ fn emit_spatial_op(op: &SpatialOp, ctx: &mut EmitCtx, var_prefix: &str) -> Resul
     let mut fetch_lines = Vec::new();
     for field_name in &n_fields {
         let (tex, swizzle) = ctx.neighbor_field_fetch(field_name);
-        fetch_lines.push(format!(
-            "            let _n_{} = textureLoad(state_tex{}, _nc, 0).{};",
-            field_name, tex, swizzle
-        ));
+        if ctx.compute_mode && ctx.use_shared {
+            fetch_lines.push(format!(
+                "            let _n_{} = shared_tex{}[_nly * PADDED + _nlx].{};",
+                field_name, tex, swizzle
+            ));
+        } else {
+            fetch_lines.push(format!(
+                "            let _n_{} = textureLoad(state_tex{}, _nc, 0).{};",
+                field_name, tex, swizzle
+            ));
+        }
     }
 
     // Check if spatial accessors are needed by walking the AST
@@ -729,6 +747,13 @@ fn emit_spatial_op(op: &SpatialOp, ctx: &mut EmitCtx, var_prefix: &str) -> Resul
 
     let closure_wgsl = emit_expr(&op.closure_body, ctx, Some(&op.closure_param))?;
 
+    // Coordinate calculation differs between fragment (textureLoad) and compute (shared memory)
+    let coord_line = if ctx.compute_mode && ctx.use_shared {
+        "                let _nlx = u32(i32(lx) + _dx);\n                let _nly = u32(i32(ly) + _dy);\n"
+    } else {
+        "                let _nc = (cell_coord + vec2i(_dx, _dy) + vec2i(uniforms.resolution)) % vec2i(uniforms.resolution);\n"
+    };
+
     let mut code = String::new();
 
     match &op.kind {
@@ -738,7 +763,7 @@ fn emit_spatial_op(op: &SpatialOp, ctx: &mut EmitCtx, var_prefix: &str) -> Resul
             code += &format!("        for (var _dy: i32 = {}; _dy <= {}; _dy++) {{\n", -r, r);
             code += &format!("            for (var _dx: i32 = {}; _dx <= {}; _dx++) {{\n", -r, r);
             code += &format!("                {}\n", skip);
-            code += "                let _nc = (cell_coord + vec2i(_dx, _dy) + vec2i(uniforms.resolution)) % vec2i(uniforms.resolution);\n";
+            code += coord_line;
             code += &fetch_block;
             code += &format!("                {} += {};\n", acc_var, closure_wgsl);
             code += "            }\n";
@@ -755,7 +780,7 @@ fn emit_spatial_op(op: &SpatialOp, ctx: &mut EmitCtx, var_prefix: &str) -> Resul
             code += &format!("        for (var _dy: i32 = {}; _dy <= {}; _dy++) {{\n", -r, r);
             code += &format!("            for (var _dx: i32 = {}; _dx <= {}; _dx++) {{\n", -r, r);
             code += &format!("                {}\n", skip);
-            code += "                let _nc = (cell_coord + vec2i(_dx, _dy) + vec2i(uniforms.resolution)) % vec2i(uniforms.resolution);\n";
+            code += coord_line;
             code += &fetch_block;
             code += &format!("                if ({}) {{ {} += 1.0; }}\n", closure_wgsl, acc_var);
             code += "            }\n";
@@ -768,7 +793,7 @@ fn emit_spatial_op(op: &SpatialOp, ctx: &mut EmitCtx, var_prefix: &str) -> Resul
             code += &format!("        for (var _dy: i32 = {}; _dy <= {}; _dy++) {{\n", -r, r);
             code += &format!("            for (var _dx: i32 = {}; _dx <= {}; _dx++) {{\n", -r, r);
             code += &format!("                {}\n", skip);
-            code += "                let _nc = (cell_coord + vec2i(_dx, _dy) + vec2i(uniforms.resolution)) % vec2i(uniforms.resolution);\n";
+            code += coord_line;
             code += &fetch_block;
             code += &format!("                {} = min({}, {});\n", acc_var, acc_var, closure_wgsl);
             code += "            }\n";
@@ -781,7 +806,7 @@ fn emit_spatial_op(op: &SpatialOp, ctx: &mut EmitCtx, var_prefix: &str) -> Resul
             code += &format!("        for (var _dy: i32 = {}; _dy <= {}; _dy++) {{\n", -r, r);
             code += &format!("            for (var _dx: i32 = {}; _dx <= {}; _dx++) {{\n", -r, r);
             code += &format!("                {}\n", skip);
-            code += "                let _nc = (cell_coord + vec2i(_dx, _dy) + vec2i(uniforms.resolution)) % vec2i(uniforms.resolution);\n";
+            code += coord_line;
             code += &fetch_block;
             code += &format!("                {} = max({}, {});\n", acc_var, acc_var, closure_wgsl);
             code += "            }\n";
@@ -799,7 +824,7 @@ fn emit_spatial_op(op: &SpatialOp, ctx: &mut EmitCtx, var_prefix: &str) -> Resul
             code += "        );\n";
             code += "        for (var _dy: i32 = -1; _dy <= 1; _dy++) {\n";
             code += "            for (var _dx: i32 = -1; _dx <= 1; _dx++) {\n";
-            code += "                let _nc = (cell_coord + vec2i(_dx, _dy) + vec2i(uniforms.resolution)) % vec2i(uniforms.resolution);\n";
+            code += coord_line;
             code += &fetch_block;
             code += &format!("                {} += ({}) * {}[_dy + 1][_dx + 1];\n", acc_var, closure_wgsl, kernel_var);
             code += "            }\n";
@@ -808,25 +833,46 @@ fn emit_spatial_op(op: &SpatialOp, ctx: &mut EmitCtx, var_prefix: &str) -> Resul
         }
         SpatialKind::Gradient => {
             let mut grad_code = String::new();
-            grad_code += "        let _nc_r = (cell_coord + vec2i(1, 0) + vec2i(uniforms.resolution)) % vec2i(uniforms.resolution);\n";
-            for field_name in &n_fields {
-                let (tex, swizzle) = ctx.neighbor_field_fetch(field_name);
-                grad_code += &format!("        let _nr_{} = textureLoad(state_tex{}, _nc_r, 0).{};\n", field_name, tex, swizzle);
-            }
-            grad_code += "        let _nc_l = (cell_coord + vec2i(-1, 0) + vec2i(uniforms.resolution)) % vec2i(uniforms.resolution);\n";
-            for field_name in &n_fields {
-                let (tex, swizzle) = ctx.neighbor_field_fetch(field_name);
-                grad_code += &format!("        let _nl_{} = textureLoad(state_tex{}, _nc_l, 0).{};\n", field_name, tex, swizzle);
-            }
-            grad_code += "        let _nc_t = (cell_coord + vec2i(0, 1) + vec2i(uniforms.resolution)) % vec2i(uniforms.resolution);\n";
-            for field_name in &n_fields {
-                let (tex, swizzle) = ctx.neighbor_field_fetch(field_name);
-                grad_code += &format!("        let _nt_{} = textureLoad(state_tex{}, _nc_t, 0).{};\n", field_name, tex, swizzle);
-            }
-            grad_code += "        let _nc_b = (cell_coord + vec2i(0, -1) + vec2i(uniforms.resolution)) % vec2i(uniforms.resolution);\n";
-            for field_name in &n_fields {
-                let (tex, swizzle) = ctx.neighbor_field_fetch(field_name);
-                grad_code += &format!("        let _nb_{} = textureLoad(state_tex{}, _nc_b, 0).{};\n", field_name, tex, swizzle);
+            if ctx.compute_mode && ctx.use_shared {
+                // Shared memory: directional reads via local coordinates
+                for field_name in &n_fields {
+                    let (tex, swizzle) = ctx.neighbor_field_fetch(field_name);
+                    grad_code += &format!("        let _nr_{} = shared_tex{}[ly * PADDED + (lx + 1u)].{};\n", field_name, tex, swizzle);
+                }
+                for field_name in &n_fields {
+                    let (tex, swizzle) = ctx.neighbor_field_fetch(field_name);
+                    grad_code += &format!("        let _nl_{} = shared_tex{}[ly * PADDED + (lx - 1u)].{};\n", field_name, tex, swizzle);
+                }
+                for field_name in &n_fields {
+                    let (tex, swizzle) = ctx.neighbor_field_fetch(field_name);
+                    grad_code += &format!("        let _nt_{} = shared_tex{}[(ly + 1u) * PADDED + lx].{};\n", field_name, tex, swizzle);
+                }
+                for field_name in &n_fields {
+                    let (tex, swizzle) = ctx.neighbor_field_fetch(field_name);
+                    grad_code += &format!("        let _nb_{} = shared_tex{}[(ly - 1u) * PADDED + lx].{};\n", field_name, tex, swizzle);
+                }
+            } else {
+                // Fragment shader / compute without shared: textureLoad
+                grad_code += "        let _nc_r = (cell_coord + vec2i(1, 0) + vec2i(uniforms.resolution)) % vec2i(uniforms.resolution);\n";
+                for field_name in &n_fields {
+                    let (tex, swizzle) = ctx.neighbor_field_fetch(field_name);
+                    grad_code += &format!("        let _nr_{} = textureLoad(state_tex{}, _nc_r, 0).{};\n", field_name, tex, swizzle);
+                }
+                grad_code += "        let _nc_l = (cell_coord + vec2i(-1, 0) + vec2i(uniforms.resolution)) % vec2i(uniforms.resolution);\n";
+                for field_name in &n_fields {
+                    let (tex, swizzle) = ctx.neighbor_field_fetch(field_name);
+                    grad_code += &format!("        let _nl_{} = textureLoad(state_tex{}, _nc_l, 0).{};\n", field_name, tex, swizzle);
+                }
+                grad_code += "        let _nc_t = (cell_coord + vec2i(0, 1) + vec2i(uniforms.resolution)) % vec2i(uniforms.resolution);\n";
+                for field_name in &n_fields {
+                    let (tex, swizzle) = ctx.neighbor_field_fetch(field_name);
+                    grad_code += &format!("        let _nt_{} = textureLoad(state_tex{}, _nc_t, 0).{};\n", field_name, tex, swizzle);
+                }
+                grad_code += "        let _nc_b = (cell_coord + vec2i(0, -1) + vec2i(uniforms.resolution)) % vec2i(uniforms.resolution);\n";
+                for field_name in &n_fields {
+                    let (tex, swizzle) = ctx.neighbor_field_fetch(field_name);
+                    grad_code += &format!("        let _nb_{} = textureLoad(state_tex{}, _nc_b, 0).{};\n", field_name, tex, swizzle);
+                }
             }
 
             let body_right = emit_expr_with_prefix(&op.closure_body, ctx, &op.closure_param, "_nr_")?;
@@ -841,11 +887,27 @@ fn emit_spatial_op(op: &SpatialOp, ctx: &mut EmitCtx, var_prefix: &str) -> Resul
         }
         SpatialKind::Divergence => {
             let mut div_code = String::new();
-            for (dir, dx, dy) in &[("r", 1, 0), ("l", -1, 0), ("t", 0, 1), ("b", 0, -1)] {
-                div_code += &format!("        let _nc_{} = (cell_coord + vec2i({}, {}) + vec2i(uniforms.resolution)) % vec2i(uniforms.resolution);\n", dir, dx, dy);
-                for field_name in &n_fields {
-                    let (tex, swizzle) = ctx.neighbor_field_fetch(field_name);
-                    div_code += &format!("        let _n{}_{} = textureLoad(state_tex{}, _nc_{}, 0).{};\n", dir, field_name, tex, dir, swizzle);
+            if ctx.compute_mode && ctx.use_shared {
+                let dirs: [(&str, &str, &str); 4] = [
+                    ("r", "lx + 1u", "ly"),
+                    ("l", "lx - 1u", "ly"),
+                    ("t", "lx", "ly + 1u"),
+                    ("b", "lx", "ly - 1u"),
+                ];
+                for (dir, lx_expr, ly_expr) in &dirs {
+                    for field_name in &n_fields {
+                        let (tex, swizzle) = ctx.neighbor_field_fetch(field_name);
+                        div_code += &format!("        let _n{}_{} = shared_tex{}[({}) * PADDED + ({})].{};\n",
+                            dir, field_name, tex, ly_expr, lx_expr, swizzle);
+                    }
+                }
+            } else {
+                for (dir, dx, dy) in &[("r", 1, 0), ("l", -1, 0), ("t", 0, 1), ("b", 0, -1)] {
+                    div_code += &format!("        let _nc_{} = (cell_coord + vec2i({}, {}) + vec2i(uniforms.resolution)) % vec2i(uniforms.resolution);\n", dir, dx, dy);
+                    for field_name in &n_fields {
+                        let (tex, swizzle) = ctx.neighbor_field_fetch(field_name);
+                        div_code += &format!("        let _n{}_{} = textureLoad(state_tex{}, _nc_{}, 0).{};\n", dir, field_name, tex, dir, swizzle);
+                    }
                 }
             }
 
@@ -867,7 +929,7 @@ fn emit_spatial_op(op: &SpatialOp, ctx: &mut EmitCtx, var_prefix: &str) -> Resul
             code += &format!("        for (var _dy: i32 = {}; _dy <= {}; _dy++) {{\n", -r, r);
             code += &format!("            for (var _dx: i32 = {}; _dx <= {}; _dx++) {{\n", -r, r);
             code += &format!("                {}\n", skip);
-            code += "                let _nc = (cell_coord + vec2i(_dx, _dy) + vec2i(uniforms.resolution)) % vec2i(uniforms.resolution);\n";
+            code += coord_line;
             code += &fetch_block;
             if let Some((ref fp, ref filter_body)) = op.filter_closure {
                 let filter_wgsl = emit_expr(filter_body, ctx, Some(fp))?;
@@ -890,7 +952,7 @@ fn emit_spatial_op(op: &SpatialOp, ctx: &mut EmitCtx, var_prefix: &str) -> Resul
             code += &format!("        for (var _dy: i32 = {}; _dy <= {}; _dy++) {{\n", -r, r);
             code += &format!("            for (var _dx: i32 = {}; _dx <= {}; _dx++) {{\n", -r, r);
             code += &format!("                {}\n", skip);
-            code += "                let _nc = (cell_coord + vec2i(_dx, _dy) + vec2i(uniforms.resolution)) % vec2i(uniforms.resolution);\n";
+            code += coord_line;
             code += &fetch_block;
             if let Some((ref fp, ref filter_body)) = op.filter_closure {
                 let filter_wgsl = emit_expr(filter_body, ctx, Some(fp))?;
@@ -906,7 +968,7 @@ fn emit_spatial_op(op: &SpatialOp, ctx: &mut EmitCtx, var_prefix: &str) -> Resul
             code += &format!("        for (var _dy: i32 = {}; _dy <= {}; _dy++) {{\n", -r, r);
             code += &format!("            for (var _dx: i32 = {}; _dx <= {}; _dx++) {{\n", -r, r);
             code += &format!("                {}\n", skip);
-            code += "                let _nc = (cell_coord + vec2i(_dx, _dy) + vec2i(uniforms.resolution)) % vec2i(uniforms.resolution);\n";
+            code += coord_line;
             code += &fetch_block;
             if let Some((ref fp, ref filter_body)) = op.filter_closure {
                 let filter_wgsl = emit_expr(filter_body, ctx, Some(fp))?;
@@ -1088,7 +1150,12 @@ fn emit_struct_output(s: &ExprStruct, ctx: &mut EmitCtx) -> Result<String> {
     }
 
     let mut output = String::new();
-    if num_textures == 1 {
+    if ctx.compute_mode {
+        for i in 0..num_textures {
+            output += &format!("        textureStore(out_tex{}, cell_coord, vec4f({}, {}, {}, {}));\n",
+                i, tex_values[i][0], tex_values[i][1], tex_values[i][2], tex_values[i][3]);
+        }
+    } else if num_textures == 1 {
         output += &format!("        return Output(vec4f({}, {}, {}, {}));",
             tex_values[0][0], tex_values[0][1], tex_values[0][2], tex_values[0][3]);
     } else {
@@ -1160,22 +1227,138 @@ fn emit_vertex_shader() -> &'static str {
     "@vertex\nfn vs_main(@builtin(vertex_index) vid: u32) -> @builtin(position) vec4f {\n    let x = f32(vid & 1u) * 4.0 - 1.0;\n    let y = f32((vid >> 1u) & 1u) * 4.0 - 1.0;\n    return vec4f(x, y, 0.0, 1.0);\n}\n\n"
 }
 
+pub fn compute_tile_config(radius: u32, num_textures: u32) -> (u32, bool) {
+    // Try 16x16 tiles first
+    let padded_16 = 16 + 2 * radius;
+    let bytes_16 = padded_16 * padded_16 * 16 * num_textures;
+    if bytes_16 <= 16384 {
+        return (16, true);
+    }
+    // Try 8x8 tiles
+    let padded_8 = 8 + 2 * radius;
+    let bytes_8 = padded_8 * padded_8 * 16 * num_textures;
+    if bytes_8 <= 16384 {
+        return (8, true);
+    }
+    // Shared memory doesn't fit — compute shader without shared memory
+    (16, false)
+}
+
+fn emit_compute_shader_header(info: &CellImplInfo, num_textures: usize, tile_size: u32, radius: u32, use_shared: bool) -> String {
+    let mut header = String::new();
+    header += "// --- Auto-generated by cellarium (compute) ---\n\n";
+
+    let param_vec4s = (info.constants.len() + 3) / 4;
+    header += "struct Uniforms {\n";
+    header += "    tick: u32,\n";
+    header += "    zoom: f32,\n";
+    header += "    resolution: vec2f,\n";
+    header += "    camera: vec2f,\n";
+    header += "    viewport: vec2f,\n";
+    if param_vec4s > 0 {
+        header += &format!("    params: array<vec4f, {}>,\n", param_vec4s);
+    }
+    header += "}\n\n";
+
+    // Read textures
+    for i in 0..num_textures {
+        header += &format!("@group(0) @binding({}) var state_tex{}: texture_2d<f32>;\n", i, i);
+    }
+    // Uniform buffer
+    header += &format!("@group(0) @binding({}) var<uniform> uniforms: Uniforms;\n", num_textures);
+    // Write textures (storage)
+    for i in 0..num_textures {
+        header += &format!("@group(0) @binding({}) var out_tex{}: texture_storage_2d<rgba32float, write>;\n",
+            num_textures + 1 + i, i);
+    }
+    header += "\n";
+
+    // Shared memory declarations
+    if use_shared {
+        let padded = tile_size + 2 * radius;
+        header += &format!("const TILE_SIZE: u32 = {}u;\n", tile_size);
+        header += &format!("const RADIUS: u32 = {}u;\n", radius);
+        header += &format!("const PADDED: u32 = {}u;\n\n", padded);
+
+        for i in 0..num_textures {
+            header += &format!("var<workgroup> shared_tex{}: array<vec4f, {}>;\n", i, padded * padded);
+        }
+        header += "\n";
+    }
+
+    // HSV helper
+    header += "fn hsv_to_rgb(h: f32, s: f32, v: f32) -> vec4f {\n";
+    header += "    let hh = ((h % 1.0) + 1.0) % 1.0;\n";
+    header += "    let c = v * s;\n";
+    header += "    let h6 = hh * 6.0;\n";
+    header += "    let x = c * (1.0 - abs(h6 % 2.0 - 1.0));\n";
+    header += "    let m = v - c;\n";
+    header += "    var rgb: vec3f;\n";
+    header += "    if (h6 < 1.0) { rgb = vec3f(c, x, 0.0); }\n";
+    header += "    else if (h6 < 2.0) { rgb = vec3f(x, c, 0.0); }\n";
+    header += "    else if (h6 < 3.0) { rgb = vec3f(0.0, c, x); }\n";
+    header += "    else if (h6 < 4.0) { rgb = vec3f(0.0, x, c); }\n";
+    header += "    else if (h6 < 5.0) { rgb = vec3f(x, 0.0, c); }\n";
+    header += "    else { rgb = vec3f(c, 0.0, x); }\n";
+    header += "    return vec4f(rgb + m, 1.0);\n";
+    header += "}\n\n";
+
+    header
+}
+
 pub fn emit_update_shader(info: &CellImplInfo, block: &Block) -> Result<String> {
     let num_textures = ((info.fields.len() + 3) / 4).max(1);
-    let mut shader = emit_shader_header(info, num_textures);
-    shader += emit_vertex_shader();
+    let radius = info.neighborhood.radius();
+    let (tile_size, use_shared) = compute_tile_config(radius, num_textures as u32);
 
-    shader += "struct Output {\n";
-    for i in 0..num_textures {
-        shader += &format!("    @location({}) tex{}: vec4f,\n", i, i);
+    let mut shader = emit_compute_shader_header(info, num_textures, tile_size, radius, use_shared);
+
+    // Compute entry point
+    shader += &format!("@compute @workgroup_size({}, {}, 1)\n", tile_size, tile_size);
+    shader += "fn cs_main(\n";
+    shader += "    @builtin(global_invocation_id) global_id: vec3u,\n";
+    shader += "    @builtin(local_invocation_id) local_id: vec3u,\n";
+    shader += "    @builtin(workgroup_id) wg_id: vec3u,\n";
+    shader += ") {\n";
+    shader += "    let cell_coord = vec2i(global_id.xy);\n";
+    shader += "    let res = vec2i(uniforms.resolution);\n\n";
+
+    // Cooperative tile loading into shared memory
+    if use_shared {
+        let padded = tile_size + 2 * radius;
+        let total = padded * padded;
+        let threads = tile_size * tile_size;
+
+        shader += &format!("    let tile_origin = vec2i(wg_id.xy) * vec2i({}i) - vec2i({}i);\n", tile_size, radius);
+        shader += &format!("    let tid = local_id.y * {}u + local_id.x;\n\n", tile_size);
+
+        shader += &format!("    for (var i = tid; i < {}u; i += {}u) {{\n", total, threads);
+        shader += &format!("        let sy = i / {}u;\n", padded);
+        shader += &format!("        let sx = i % {}u;\n", padded);
+        shader += "        let gc = (tile_origin + vec2i(i32(sx), i32(sy)) + res) % res;\n";
+        for i in 0..num_textures {
+            shader += &format!("        shared_tex{}[i] = textureLoad(state_tex{}, gc, 0);\n", i, i);
+        }
+        shader += "    }\n\n";
+        shader += "    workgroupBarrier();\n\n";
     }
-    shader += "}\n\n";
 
-    shader += "@fragment\nfn fs_main(@builtin(position) frag_pos: vec4f) -> Output {\n";
-    shader += "    let cell_coord = vec2i(frag_pos.xy);\n\n";
+    // Bounds check (after barrier so all threads participate in loading)
+    shader += "    if (global_id.x >= u32(res.x) || global_id.y >= u32(res.y)) {\n";
+    shader += "        return;\n";
+    shader += "    }\n\n";
+
+    // Local coordinates within shared tile (for shared memory indexing)
+    if use_shared {
+        shader += &format!("    let lx = local_id.x + {}u;\n", radius);
+        shader += &format!("    let ly = local_id.y + {}u;\n\n", radius);
+    }
+
     shader += &emit_param_reads(info);
 
     let mut ctx = EmitCtx::new(info);
+    ctx.compute_mode = true;
+    ctx.use_shared = use_shared;
 
     for field in &info.fields {
         ctx.ensure_self_field(&field.name);

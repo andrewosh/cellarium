@@ -28,6 +28,7 @@ impl TextureState {
                 format: TextureFormat::Rgba32Float,
                 usage: TextureUsages::TEXTURE_BINDING
                     | TextureUsages::RENDER_ATTACHMENT
+                    | TextureUsages::STORAGE_BINDING
                     | TextureUsages::COPY_DST,
                 view_formats: &[],
             };
