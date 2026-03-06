@@ -218,25 +218,35 @@ fn discover_neighbor_fields_in_expr(expr: &Expr, names: &mut Vec<String>, seen: 
 }
 
 // Check if an expression tree contains spatial accessor calls (offset/direction/distance)
-fn expr_needs_spatial_accessors(expr: &Expr, closure_param: &str) -> bool {
+/// Which spatial accessors an expression needs: (offset, distance, direction)
+fn expr_spatial_needs(expr: &Expr, closure_param: &str) -> (bool, bool, bool) {
+    let merge = |a: (bool,bool,bool), b: (bool,bool,bool)| (a.0||b.0, a.1||b.1, a.2||b.2);
+    fn fold_iter(iter: &mut dyn Iterator<Item=(bool,bool,bool)>) -> (bool,bool,bool) {
+        iter.fold((false,false,false), |a, b| (a.0||b.0, a.1||b.1, a.2||b.2))
+    }
+
     match expr {
         Expr::MethodCall(mc) => {
             let method = mc.method.to_string();
+            let mut needs = (false, false, false);
             if let Expr::Path(p) = &*mc.receiver {
                 if let Some(ident) = p.path.get_ident() {
                     if ident.to_string() == closure_param {
-                        if method == "offset" || method == "direction" || method == "distance" {
-                            return true;
+                        match method.as_str() {
+                            "offset" => needs.0 = true,
+                            "distance" => { needs.0 = true; needs.1 = true; }
+                            "direction" => { needs.0 = true; needs.1 = true; needs.2 = true; }
+                            _ => {}
                         }
                     }
                 }
             }
-            if expr_needs_spatial_accessors(&mc.receiver, closure_param) {
-                return true;
-            }
-            mc.args.iter().any(|a| expr_needs_spatial_accessors(a, closure_param))
+            let recv = expr_spatial_needs(&mc.receiver, closure_param);
+            let args = fold_iter(&mut mc.args.iter().map(|a| expr_spatial_needs(a, closure_param)));
+            merge(needs, merge(recv, args))
         }
         Expr::Field(f) => {
+            let mut needs = (false, false, false);
             if let Expr::Path(p) = &*f.base {
                 if let Some(ident) = p.path.get_ident() {
                     if ident.to_string() == closure_param {
@@ -244,34 +254,43 @@ fn expr_needs_spatial_accessors(expr: &Expr, closure_param: &str) -> bool {
                             Member::Named(n) => n.to_string(),
                             _ => String::new(),
                         };
-                        if name == "offset" || name == "direction" || name == "distance" {
-                            return true;
+                        match name.as_str() {
+                            "offset" => needs.0 = true,
+                            "distance" => { needs.0 = true; needs.1 = true; }
+                            "direction" => { needs.0 = true; needs.1 = true; needs.2 = true; }
+                            _ => {}
                         }
                     }
                 }
             }
-            expr_needs_spatial_accessors(&f.base, closure_param)
+            merge(needs, expr_spatial_needs(&f.base, closure_param))
         }
-        Expr::Binary(b) => {
-            expr_needs_spatial_accessors(&b.left, closure_param)
-                || expr_needs_spatial_accessors(&b.right, closure_param)
-        }
-        Expr::Unary(u) => expr_needs_spatial_accessors(&u.expr, closure_param),
-        Expr::Paren(p) => expr_needs_spatial_accessors(&p.expr, closure_param),
-        Expr::Group(g) => expr_needs_spatial_accessors(&g.expr, closure_param),
-        Expr::Call(c) => {
-            expr_needs_spatial_accessors(&c.func, closure_param)
-                || c.args.iter().any(|a| expr_needs_spatial_accessors(a, closure_param))
-        }
+        Expr::Binary(b) => merge(
+            expr_spatial_needs(&b.left, closure_param),
+            expr_spatial_needs(&b.right, closure_param),
+        ),
+        Expr::Unary(u) => expr_spatial_needs(&u.expr, closure_param),
+        Expr::Paren(p) => expr_spatial_needs(&p.expr, closure_param),
+        Expr::Group(g) => expr_spatial_needs(&g.expr, closure_param),
+        Expr::Call(c) => merge(
+            expr_spatial_needs(&c.func, closure_param),
+            fold_iter(&mut c.args.iter().map(|a| expr_spatial_needs(a, closure_param))),
+        ),
         Expr::If(i) => {
-            expr_needs_spatial_accessors(&i.cond, closure_param)
-                || i.then_branch.stmts.iter().any(|s| {
-                    if let Stmt::Expr(e, _) = s { expr_needs_spatial_accessors(e, closure_param) } else { false }
-                })
-                || i.else_branch.as_ref().map_or(false, |(_, e)| expr_needs_spatial_accessors(e, closure_param))
+            let cond = expr_spatial_needs(&i.cond, closure_param);
+            let then_br = fold_iter(&mut i.then_branch.stmts.iter().map(|s| {
+                if let Stmt::Expr(e, _) = s { expr_spatial_needs(e, closure_param) } else { (false,false,false) }
+            }));
+            let else_br = i.else_branch.as_ref().map_or((false,false,false), |(_, e)| expr_spatial_needs(e, closure_param));
+            merge(cond, merge(then_br, else_br))
         }
-        _ => false,
+        _ => (false, false, false),
     }
+}
+
+fn expr_needs_spatial_accessors(expr: &Expr, closure_param: &str) -> bool {
+    let (o, d, dir) = expr_spatial_needs(expr, closure_param);
+    o || d || dir
 }
 
 // ---------------------------------------------------------------------------
@@ -287,6 +306,7 @@ struct EmitCtx<'a> {
     self_fields_fetched: HashSet<String>,
     compute_mode: bool,
     use_shared: bool,
+    pending_spatial_ops: Vec<DeferredSpatialOp>,
 }
 
 impl<'a> EmitCtx<'a> {
@@ -300,6 +320,7 @@ impl<'a> EmitCtx<'a> {
             self_fields_fetched: HashSet::new(),
             compute_mode: false,
             use_shared: false,
+            pending_spatial_ops: Vec::new(),
         }
     }
 
@@ -489,6 +510,9 @@ fn emit_method_call(mc: &ExprMethodCall, ctx: &mut EmitCtx, closure_param: Optio
         if let Some(ident) = p.path.get_ident() {
             if ident == "nb" {
                 if let Some(spatial_op) = parse_spatial_op(mc) {
+                    // Inline spatial ops can't be deferred (they're sub-expressions),
+                    // so flush any pending ops first, then emit standalone
+                    flush_pending_spatial_ops(ctx)?;
                     let id = ctx.next_id();
                     let var_name = format!("_spatial_{}", id);
                     let op_code = emit_spatial_op(&spatial_op, ctx, &var_name)?;
@@ -628,6 +652,7 @@ fn emit_if(if_expr: &ExprIf, ctx: &mut EmitCtx, closure_param: Option<&str>) -> 
 // Spatial operator emission
 // ---------------------------------------------------------------------------
 
+#[derive(Clone)]
 struct SpatialOp {
     kind: SpatialKind,
     closure_param: String,
@@ -635,6 +660,21 @@ struct SpatialOp {
     filter_closure: Option<(String, Expr)>,
 }
 
+struct DeferredSpatialOp {
+    op: SpatialOp,
+    result_var: String,
+}
+
+fn is_fusible(kind: &SpatialKind) -> bool {
+    matches!(kind,
+        SpatialKind::Sum | SpatialKind::Mean | SpatialKind::Count |
+        SpatialKind::Min | SpatialKind::Max |
+        SpatialKind::SumWhere | SpatialKind::MeanWhere |
+        SpatialKind::MinWhere | SpatialKind::MaxWhere
+    )
+}
+
+#[derive(Clone, Copy)]
 enum SpatialKind {
     Sum,
     Mean,
@@ -732,14 +772,23 @@ fn emit_spatial_op(op: &SpatialOp, ctx: &mut EmitCtx, var_prefix: &str) -> Resul
         }
     }
 
-    // Check if spatial accessors are needed by walking the AST
-    let needs_offset = expr_needs_spatial_accessors(&op.closure_body, &op.closure_param)
-        || op.filter_closure.as_ref().map_or(false, |(fp, fb)| expr_needs_spatial_accessors(fb, fp));
+    // Check which spatial accessors are actually used
+    let body_needs = expr_spatial_needs(&op.closure_body, &op.closure_param);
+    let filter_needs = op.filter_closure.as_ref().map_or((false,false,false), |(fp, fb)| expr_spatial_needs(fb, fp));
+    let (needs_offset, needs_distance, needs_direction) = (
+        body_needs.0 || filter_needs.0,
+        body_needs.1 || filter_needs.1,
+        body_needs.2 || filter_needs.2,
+    );
 
     let mut spatial_lines = Vec::new();
     if needs_offset {
         spatial_lines.push("            let _n_offset = vec2f(f32(_dx), f32(_dy));".to_string());
+    }
+    if needs_distance {
         spatial_lines.push("            let _n_distance = length(_n_offset);".to_string());
+    }
+    if needs_direction {
         spatial_lines.push("            let _n_direction = select(vec2f(0.0, 0.0), normalize(_n_offset), _n_distance > 0.0);".to_string());
     }
 
@@ -1035,6 +1084,193 @@ fn emit_expr_with_prefix(expr: &Expr, ctx: &mut EmitCtx, closure_param: &str, pr
 }
 
 // ---------------------------------------------------------------------------
+// Spatial op loop fusion
+// ---------------------------------------------------------------------------
+
+fn flush_pending_spatial_ops(ctx: &mut EmitCtx) -> Result<()> {
+    if ctx.pending_spatial_ops.is_empty() {
+        return Ok(());
+    }
+
+    let ops = std::mem::take(&mut ctx.pending_spatial_ops);
+
+    if ops.len() == 1 {
+        let d = &ops[0];
+        let op_code = emit_spatial_op(&d.op, ctx, &d.result_var)?;
+        ctx.body.push(op_code);
+        return Ok(());
+    }
+
+    let fused_code = emit_fused_spatial_ops(&ops, ctx)?;
+    ctx.body.push(fused_code);
+    Ok(())
+}
+
+fn emit_fused_spatial_ops(ops: &[DeferredSpatialOp], ctx: &mut EmitCtx) -> Result<String> {
+    let neighborhood = &ctx.info.neighborhood;
+    let r = neighborhood.radius() as i32;
+    let skip = neighborhood.skip_condition();
+    let n_count = neighborhood.neighbor_count();
+
+    let mut code = String::new();
+
+    // Phase 1: Declare all accumulator variables
+    for d in ops {
+        let var = &d.result_var;
+        match d.op.kind {
+            SpatialKind::Sum | SpatialKind::Mean => {
+                code += &format!("        var {}_acc: f32 = 0.0;\n", var);
+            }
+            SpatialKind::Count => {
+                code += &format!("        var {}_acc: f32 = 0.0;\n", var);
+            }
+            SpatialKind::Min | SpatialKind::MinWhere => {
+                code += &format!("        var {}_acc: f32 = 999999.0;\n", var);
+            }
+            SpatialKind::Max | SpatialKind::MaxWhere => {
+                code += &format!("        var {}_acc: f32 = -999999.0;\n", var);
+            }
+            SpatialKind::SumWhere | SpatialKind::MeanWhere => {
+                code += &format!("        var {}_acc: f32 = 0.0;\n", var);
+                code += &format!("        var {}_cnt: f32 = 0.0;\n", var);
+            }
+            _ => {}
+        }
+    }
+
+    // Phase 2: Collect union of all neighbor fields and spatial accessor needs
+    let mut all_fields = Vec::new();
+    let mut all_fields_seen = HashSet::new();
+    let mut fused_needs = (false, false, false);
+
+    for d in ops {
+        discover_neighbor_fields_in_expr(&d.op.closure_body, &mut all_fields, &mut all_fields_seen, &d.op.closure_param);
+        if let Some((ref fp, ref filter_body)) = d.op.filter_closure {
+            discover_neighbor_fields_in_expr(filter_body, &mut all_fields, &mut all_fields_seen, fp);
+        }
+        let bn = expr_spatial_needs(&d.op.closure_body, &d.op.closure_param);
+        fused_needs = (fused_needs.0||bn.0, fused_needs.1||bn.1, fused_needs.2||bn.2);
+        if let Some((ref fp, ref fb)) = d.op.filter_closure {
+            let fn_ = expr_spatial_needs(fb, fp);
+            fused_needs = (fused_needs.0||fn_.0, fused_needs.1||fn_.1, fused_needs.2||fn_.2);
+        }
+    }
+    let (needs_offset, needs_distance, needs_direction) = fused_needs;
+
+    // Phase 3: Build unified fetch block
+    let mut fetch_lines = Vec::new();
+    for field_name in &all_fields {
+        let (tex, swizzle) = ctx.neighbor_field_fetch(field_name);
+        if ctx.compute_mode && ctx.use_shared {
+            fetch_lines.push(format!(
+                "            let _n_{} = shared_tex{}[_nly * PADDED + _nlx].{};",
+                field_name, tex, swizzle
+            ));
+        } else {
+            fetch_lines.push(format!(
+                "            let _n_{} = textureLoad(state_tex{}, _nc, 0).{};",
+                field_name, tex, swizzle
+            ));
+        }
+    }
+
+    let mut spatial_lines = Vec::new();
+    if needs_offset {
+        spatial_lines.push("            let _n_offset = vec2f(f32(_dx), f32(_dy));".to_string());
+    }
+    if needs_distance {
+        spatial_lines.push("            let _n_distance = length(_n_offset);".to_string());
+    }
+    if needs_direction {
+        spatial_lines.push("            let _n_direction = select(vec2f(0.0, 0.0), normalize(_n_offset), _n_distance > 0.0);".to_string());
+    }
+
+    let fetch_block = [fetch_lines.join("\n"), spatial_lines.join("\n")].join("\n");
+
+    let coord_line = if ctx.compute_mode && ctx.use_shared {
+        "                let _nlx = u32(i32(lx) + _dx);\n                let _nly = u32(i32(ly) + _dy);\n"
+    } else {
+        "                let _nc = (cell_coord + vec2i(_dx, _dy) + vec2i(uniforms.resolution)) % vec2i(uniforms.resolution);\n"
+    };
+
+    // Phase 4: Emit single fused loop
+    code += &format!("        for (var _dy: i32 = {}; _dy <= {}; _dy++) {{\n", -r, r);
+    code += &format!("            for (var _dx: i32 = {}; _dx <= {}; _dx++) {{\n", -r, r);
+    code += &format!("                {}\n", skip);
+    code += coord_line;
+    code += &fetch_block;
+    code += "\n";
+
+    // Phase 5: Per-op accumulation
+    for d in ops {
+        let var = &d.result_var;
+        let closure_wgsl = emit_expr(&d.op.closure_body, ctx, Some(&d.op.closure_param))?;
+
+        match d.op.kind {
+            SpatialKind::Sum | SpatialKind::Mean => {
+                code += &format!("                {}_acc += {};\n", var, closure_wgsl);
+            }
+            SpatialKind::Count => {
+                code += &format!("                if ({}) {{ {}_acc += 1.0; }}\n", closure_wgsl, var);
+            }
+            SpatialKind::Min => {
+                code += &format!("                {}_acc = min({}_acc, {});\n", var, var, closure_wgsl);
+            }
+            SpatialKind::Max => {
+                code += &format!("                {}_acc = max({}_acc, {});\n", var, var, closure_wgsl);
+            }
+            SpatialKind::SumWhere | SpatialKind::MeanWhere => {
+                if let Some((ref fp, ref filter_body)) = d.op.filter_closure {
+                    let filter_wgsl = emit_expr(filter_body, ctx, Some(fp))?;
+                    code += &format!("                if ({}) {{\n", filter_wgsl);
+                    code += &format!("                    {}_acc += {};\n", var, closure_wgsl);
+                    code += &format!("                    {}_cnt += 1.0;\n", var);
+                    code += "                }\n";
+                }
+            }
+            SpatialKind::MinWhere => {
+                if let Some((ref fp, ref filter_body)) = d.op.filter_closure {
+                    let filter_wgsl = emit_expr(filter_body, ctx, Some(fp))?;
+                    code += &format!("                if ({}) {{ {}_acc = min({}_acc, {}); }}\n", filter_wgsl, var, var, closure_wgsl);
+                }
+            }
+            SpatialKind::MaxWhere => {
+                if let Some((ref fp, ref filter_body)) = d.op.filter_closure {
+                    let filter_wgsl = emit_expr(filter_body, ctx, Some(fp))?;
+                    code += &format!("                if ({}) {{ {}_acc = max({}_acc, {}); }}\n", filter_wgsl, var, var, closure_wgsl);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    code += "            }\n";
+    code += "        }\n";
+
+    // Phase 6: Finalization
+    for d in ops {
+        let var = &d.result_var;
+        match d.op.kind {
+            SpatialKind::Sum | SpatialKind::Count |
+            SpatialKind::Min | SpatialKind::Max |
+            SpatialKind::SumWhere |
+            SpatialKind::MinWhere | SpatialKind::MaxWhere => {
+                code += &format!("        let {} = {}_acc;\n", var, var);
+            }
+            SpatialKind::Mean => {
+                code += &format!("        let {} = {}_acc / {}.0;\n", var, var, n_count);
+            }
+            SpatialKind::MeanWhere => {
+                code += &format!("        let {} = select({}_acc / {}_cnt, 0.0, {}_cnt == 0.0);\n", var, var, var, var);
+            }
+            _ => {}
+        }
+    }
+
+    Ok(code)
+}
+
+// ---------------------------------------------------------------------------
 // Statement-level emission
 // ---------------------------------------------------------------------------
 
@@ -1056,17 +1292,30 @@ fn emit_stmt(stmt: &Stmt, ctx: &mut EmitCtx) -> Result<()> {
             if let Some(init) = &local.init {
                 // Check if this is a spatial operator assignment
                 if let Some(spatial_op) = try_parse_spatial_assignment(&init.expr) {
-                    let op_code = emit_spatial_op(&spatial_op, ctx, &user_var(&name))?;
-                    ctx.body.push(op_code);
-                    return Ok(());
+                    if is_fusible(&spatial_op.kind) {
+                        ctx.pending_spatial_ops.push(DeferredSpatialOp {
+                            op: spatial_op,
+                            result_var: user_var(&name),
+                        });
+                        return Ok(());
+                    } else {
+                        // Non-fusible (e.g., Laplacian, Gradient) — flush pending, emit standalone
+                        flush_pending_spatial_ops(ctx)?;
+                        let op_code = emit_spatial_op(&spatial_op, ctx, &user_var(&name))?;
+                        ctx.body.push(op_code);
+                        return Ok(());
+                    }
                 }
 
+                // Non-spatial statement — flush any pending spatial ops first
+                flush_pending_spatial_ops(ctx)?;
                 let val = emit_expr(&init.expr, ctx, None)?;
                 ctx.body.push(format!("        let {} = {};", user_var(&name), val));
             }
             Ok(())
         }
         Stmt::Expr(expr, semi) => {
+            flush_pending_spatial_ops(ctx)?;
             match expr {
                 Expr::Return(ret) => {
                     if let Some(ret_expr) = &ret.expr {
@@ -1228,19 +1477,24 @@ fn emit_vertex_shader() -> &'static str {
 }
 
 pub fn compute_tile_config(radius: u32, num_textures: u32) -> (u32, bool) {
-    // Try 16x16 tiles first
-    let padded_16 = 16 + 2 * radius;
-    let bytes_16 = padded_16 * padded_16 * 16 * num_textures;
-    if bytes_16 <= 16384 {
-        return (16, true);
+    // Shared memory trades global reads for occupancy. For it to be worthwhile,
+    // the padded tile must be small enough that many workgroups can be resident
+    // per GPU core simultaneously (for latency hiding). At large radii the tile
+    // dominates shared memory and cripples occupancy — the texture cache handles
+    // locality better in that regime.
+    //
+    // Heuristic: only use shared memory when the padded tile fits in ≤4KB,
+    // which allows 8+ workgroups per core on a 32KB budget.
+    let shared_budget: u32 = 4096;
+
+    for &tile in &[16u32, 8] {
+        let padded = tile + 2 * radius;
+        let bytes = padded * padded * 16 * num_textures;
+        if bytes <= shared_budget && tile * tile <= 256 {
+            return (tile, true);
+        }
     }
-    // Try 8x8 tiles
-    let padded_8 = 8 + 2 * radius;
-    let bytes_8 = padded_8 * padded_8 * 16 * num_textures;
-    if bytes_8 <= 16384 {
-        return (8, true);
-    }
-    // Shared memory doesn't fit — compute shader without shared memory
+    // No shared memory — rely on texture cache, maximize occupancy
     (16, false)
 }
 
@@ -1374,6 +1628,9 @@ pub fn emit_update_shader(info: &CellImplInfo, block: &Block) -> Result<String> 
         emit_stmt(stmt, &mut ctx)?;
     }
 
+    // Flush any remaining pending spatial ops
+    flush_pending_spatial_ops(&mut ctx)?;
+
     for line in &ctx.body {
         shader += line;
         shader += "\n";
@@ -1398,7 +1655,10 @@ pub fn emit_view_shader(info: &CellImplInfo, block: &Block) -> Result<String> {
     shader += "    let center = uniforms.viewport * 0.5;\n";
     shader += "    let view_pos = (frag_pos.xy - center) / uniforms.zoom + uniforms.camera;\n";
     shader += "    let cell_coord_raw = vec2i(floor(view_pos));\n";
-    shader += "    let cell_coord = (cell_coord_raw % vec2i(uniforms.resolution) + vec2i(uniforms.resolution)) % vec2i(uniforms.resolution);\n\n";
+    shader += "    if (cell_coord_raw.x < 0 || cell_coord_raw.y < 0 || cell_coord_raw.x >= i32(uniforms.resolution.x) || cell_coord_raw.y >= i32(uniforms.resolution.y)) {\n";
+    shader += "        return vec4f(0.0, 0.0, 0.0, 1.0);\n";
+    shader += "    }\n";
+    shader += "    let cell_coord = cell_coord_raw;\n\n";
     shader += &emit_param_reads(info);
 
     let mut ctx = EmitCtx::new(info);
@@ -1502,7 +1762,8 @@ pub fn emit_init_shader(info: &CellImplInfo, block: &Block) -> Result<String> {
     shader += "    let v_x = f32(cell_coord.x);\n";
     shader += "    let v_y = f32(cell_coord.y);\n";
     shader += "    let v_w = uniforms.resolution.x;\n";
-    shader += "    let v_h = uniforms.resolution.y;\n\n";
+    shader += "    let v_h = uniforms.resolution.y;\n";
+    shader += "    let v_seed = f32(uniforms.tick);\n\n";
     shader += &emit_param_reads(info);
 
     let mut ctx = EmitCtx::new(info);

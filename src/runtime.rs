@@ -1,4 +1,5 @@
 use std::sync::{Arc, Mutex};
+use std::path::PathBuf;
 
 use wgpu::*;
 use winit::{
@@ -66,6 +67,7 @@ impl<T: Cell> Simulation<T> {
         let shared = Arc::new(Mutex::new(ParamState {
             values: T::PARAM_DEFAULTS.to_vec(),
             defaults: T::PARAM_DEFAULTS.to_vec(),
+            starting_values: T::PARAM_DEFAULTS.to_vec(),
             names: T::PARAM_NAMES.iter().map(|s| s.to_string()).collect(),
             selected: 0,
             title: self.title.clone(),
@@ -74,6 +76,7 @@ impl<T: Cell> Simulation<T> {
             history: Vec::new(),
             replay: Vec::new(),
             replay_cursor: 0,
+            status_msg: None,
         }));
 
         // Auto-load params from CLI arg if provided
@@ -126,6 +129,7 @@ struct GpuState {
     shift_held: bool,
     shared_params: SharedParams,
     param_count: usize,
+    seed: u32,
 }
 
 impl GpuState {
@@ -260,7 +264,7 @@ impl GpuState {
         let Some(ref init_pipeline) = self.pipelines.init_pipeline else { return };
         let Some(ref init_bgl) = self.pipelines.init_bind_group_layout else { return };
 
-        self.write_uniforms(0);
+        self.write_uniforms(self.seed);
 
         let mut encoder = self.device.create_command_encoder(&CommandEncoderDescriptor {
             label: Some("init_encoder"),
@@ -315,6 +319,164 @@ impl GpuState {
             let defaults = T::defaults();
             self.textures.write_defaults(&self.queue, &defaults);
         }
+    }
+
+    fn take_screenshot(&mut self) -> Result<PathBuf, String> {
+        let grid_w = self.textures.width;
+        let grid_h = self.textures.height;
+        let tile_size: u32 = 2048;
+        let bpp = 4u32;
+
+        // Create one reusable tile texture + staging buffer
+        let tile_unpadded_row = tile_size * bpp;
+        let tile_padded_row = (tile_unpadded_row + 255) & !255;
+
+        let offscreen = self.device.create_texture(&TextureDescriptor {
+            label: Some("screenshot_tile"),
+            size: Extent3d { width: tile_size, height: tile_size, depth_or_array_layers: 1 },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: TextureDimension::D2,
+            format: TextureFormat::Rgba8Unorm,
+            usage: TextureUsages::RENDER_ATTACHMENT | TextureUsages::COPY_SRC,
+            view_formats: &[],
+        });
+        let offscreen_view = offscreen.create_view(&TextureViewDescriptor::default());
+
+        let staging = self.device.create_buffer(&BufferDescriptor {
+            label: Some("screenshot_staging"),
+            size: (tile_padded_row * tile_size) as u64,
+            usage: BufferUsages::MAP_READ | BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+
+        let saved_zoom = self.zoom;
+        let saved_camera = self.camera;
+        let saved_viewport = self.viewport;
+        let saved_paused = self.paused;
+        self.paused = true;
+
+        let mut pixels = vec![0u8; (grid_w * grid_h * bpp) as usize];
+        let dst_row_bytes = (grid_w * bpp) as usize;
+
+        let tiles_x = (grid_w + tile_size - 1) / tile_size;
+        let tiles_y = (grid_h + tile_size - 1) / tile_size;
+
+        for ty in 0..tiles_y {
+            for tx in 0..tiles_x {
+                let tile_x = tx * tile_size;
+                let tile_y = ty * tile_size;
+                let tile_w = tile_size.min(grid_w - tile_x);
+                let tile_h = tile_size.min(grid_h - tile_y);
+
+                // Camera at tile center, viewport = tile size, zoom = 1
+                self.zoom = 1.0;
+                self.camera = [tile_x as f32 + tile_size as f32 / 2.0,
+                               tile_y as f32 + tile_size as f32 / 2.0];
+                self.viewport = [tile_size as f32, tile_size as f32];
+                self.write_uniforms(self.tick);
+
+                let mut encoder = self.device.create_command_encoder(&CommandEncoderDescriptor {
+                    label: Some("screenshot_tile_encoder"),
+                });
+
+                {
+                    let read_views = self.textures.read_views();
+                    let bind_group = {
+                        let view_refs: Vec<&TextureView> = read_views.iter().collect();
+                        pipeline::create_bind_group(
+                            &self.device,
+                            &self.pipelines.view_bind_group_layout,
+                            &view_refs,
+                            &self.uniform_buffer,
+                            self.texture_count,
+                        )
+                    };
+
+                    let mut pass = encoder.begin_render_pass(&RenderPassDescriptor {
+                        label: Some("screenshot_tile_pass"),
+                        color_attachments: &[Some(RenderPassColorAttachment {
+                            view: &offscreen_view,
+                            depth_slice: None,
+                            resolve_target: None,
+                            ops: Operations {
+                                load: LoadOp::Clear(Color::BLACK),
+                                store: StoreOp::Store,
+                            },
+                        })],
+                        depth_stencil_attachment: None,
+                        timestamp_writes: None,
+                        occlusion_query_set: None,
+                        multiview_mask: None,
+                    });
+                    pass.set_pipeline(&self.pipelines.screenshot_pipeline);
+                    pass.set_bind_group(0, &bind_group, &[]);
+                    pass.draw(0..3, 0..1);
+                }
+
+                encoder.copy_texture_to_buffer(
+                    TexelCopyTextureInfo {
+                        texture: &offscreen,
+                        mip_level: 0,
+                        origin: Origin3d::ZERO,
+                        aspect: TextureAspect::All,
+                    },
+                    TexelCopyBufferInfo {
+                        buffer: &staging,
+                        layout: TexelCopyBufferLayout {
+                            offset: 0,
+                            bytes_per_row: Some(tile_padded_row),
+                            rows_per_image: Some(tile_size),
+                        },
+                    },
+                    Extent3d { width: tile_size, height: tile_size, depth_or_array_layers: 1 },
+                );
+
+                let sub_idx = self.queue.submit(std::iter::once(encoder.finish()));
+
+                let buffer_slice = staging.slice(..);
+                let (stx, srx) = std::sync::mpsc::channel();
+                buffer_slice.map_async(MapMode::Read, move |result| {
+                    let _ = stx.send(result);
+                });
+                let _ = self.device.poll(PollType::Wait {
+                    submission_index: Some(sub_idx),
+                    timeout: Some(std::time::Duration::from_secs(30)),
+                });
+                srx.recv().map_err(|e| format!("recv failed: {}", e))?
+                    .map_err(|e| format!("Buffer map failed: {:?}", e))?;
+
+                let data = buffer_slice.get_mapped_range();
+                for row in 0..tile_h as usize {
+                    let dst_y = tile_y as usize + row;
+                    let dst_offset = dst_y * dst_row_bytes + tile_x as usize * bpp as usize;
+                    let src_offset = row * tile_padded_row as usize;
+                    let copy_bytes = tile_w as usize * bpp as usize;
+                    pixels[dst_offset..dst_offset + copy_bytes]
+                        .copy_from_slice(&data[src_offset..src_offset + copy_bytes]);
+                }
+                drop(data);
+                staging.unmap();
+            }
+        }
+
+        // Restore state
+        self.zoom = saved_zoom;
+        self.camera = saved_camera;
+        self.viewport = saved_viewport;
+        self.paused = saved_paused;
+
+        // Save as PNG
+        let timestamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis();
+        let filename = format!("screenshot_{}_{}.tiff", std::process::id(), timestamp);
+        let path = PathBuf::from(&filename);
+        image::save_buffer(&path, &pixels, grid_w, grid_h, image::ColorType::Rgba8)
+            .map_err(|e| format!("Save failed: {}", e))?;
+
+        Ok(path)
     }
 
     fn resize_grid<T: Cell>(&mut self, new_width: u32, new_height: u32) {
@@ -383,7 +545,10 @@ impl<T: Cell> ApplicationHandler for App<T> {
             let (device, queue) = adapter.request_device(&DeviceDescriptor {
                 label: Some("cellarium_device"),
                 required_features: Features::empty(),
-                required_limits: Limits::default(),
+                required_limits: Limits {
+                    max_texture_dimension_2d: adapter.limits().max_texture_dimension_2d,
+                    ..Limits::default()
+                },
                 memory_hints: MemoryHints::Performance,
                 trace: Default::default(),
                 experimental_features: Default::default(),
@@ -454,6 +619,7 @@ impl<T: Cell> ApplicationHandler for App<T> {
                 shift_held: false,
                 shared_params,
                 param_count,
+                seed: 0,
             };
 
             // Initialize state
@@ -507,9 +673,9 @@ impl<T: Cell> ApplicationHandler for App<T> {
                         {
                             let mut state = gpu.shared_params.lock().unwrap();
                             state.record_resize(w, h);
+                            state.status_msg = Some(format!("Grid: {}x{}", w, h));
                         }
                         gpu.resize_grid::<T>(w, h);
-                        eprintln!("Grid: {}x{}", w, h);
                         window.request_redraw();
                     }
                     KeyCode::BracketLeft => {
@@ -519,13 +685,22 @@ impl<T: Cell> ApplicationHandler for App<T> {
                             {
                                 let mut state = gpu.shared_params.lock().unwrap();
                                 state.record_resize(w, h);
+                                state.status_msg = Some(format!("Grid: {}x{}", w, h));
                             }
                             gpu.resize_grid::<T>(w, h);
-                            eprintln!("Grid: {}x{}", w, h);
                             window.request_redraw();
                         }
                     }
                     KeyCode::KeyR => {
+                        {
+                            let mut state = gpu.shared_params.lock().unwrap();
+                            state.record_reset();
+                        }
+                        gpu.reset::<T>();
+                        window.request_redraw();
+                    }
+                    KeyCode::KeyT => {
+                        gpu.seed = gpu.seed.wrapping_add(1);
                         {
                             let mut state = gpu.shared_params.lock().unwrap();
                             state.record_reset();
@@ -549,16 +724,14 @@ impl<T: Cell> ApplicationHandler for App<T> {
                         let mut state = gpu.shared_params.lock().unwrap();
                         if !state.values.is_empty() {
                             let i = state.selected;
-                            let new_val = state.values[i] / factor;
-                            state.set_param(i, new_val);
+                            state.adjust_param(i, 1.0 / factor);
                         }
                     }
                     KeyCode::ArrowRight => {
                         let mut state = gpu.shared_params.lock().unwrap();
                         if !state.values.is_empty() {
                             let i = state.selected;
-                            let new_val = state.values[i] * factor;
-                            state.set_param(i, new_val);
+                            state.adjust_param(i, factor);
                         } else if gpu.paused {
                             drop(state);
                             gpu.run_tick();
@@ -574,11 +747,23 @@ impl<T: Cell> ApplicationHandler for App<T> {
                             }
                         }
                     }
+                    KeyCode::KeyP => {
+                        match gpu.take_screenshot() {
+                            Ok(path) => {
+                                let mut state = gpu.shared_params.lock().unwrap();
+                                state.status_msg = Some(format!("Saved {}", path.display()));
+                            }
+                            Err(e) => {
+                                let mut state = gpu.shared_params.lock().unwrap();
+                                state.status_msg = Some(e);
+                            }
+                        }
+                    }
                     KeyCode::KeyS => {
-                        let state = gpu.shared_params.lock().unwrap();
+                        let mut state = gpu.shared_params.lock().unwrap();
                         match tui::save_params(&state) {
-                            Ok(path) => eprintln!("Saved to {}", path),
-                            Err(e) => eprintln!("Save failed: {}", e),
+                            Ok(path) => state.status_msg = Some(format!("Saved to {}", path)),
+                            Err(e) => state.status_msg = Some(format!("Save failed: {}", e)),
                         }
                     }
                     _ => {}
@@ -586,6 +771,18 @@ impl<T: Cell> ApplicationHandler for App<T> {
             }
             WindowEvent::ModifiersChanged(modifiers) => {
                 gpu.shift_held = modifiers.state().shift_key();
+            }
+            WindowEvent::Resized(new_size) => {
+                if new_size.width > 0 && new_size.height > 0 {
+                    gpu.surface_config.width = new_size.width;
+                    gpu.surface_config.height = new_size.height;
+                    gpu.surface.configure(&gpu.device, &gpu.surface_config);
+                    gpu.viewport = [new_size.width as f32, new_size.height as f32];
+                    gpu.default_zoom = (new_size.width as f32 / gpu.textures.width as f32)
+                        .min(new_size.height as f32 / gpu.textures.height as f32);
+                    gpu.zoom = gpu.zoom.max(0.1);
+                    window.request_redraw();
+                }
             }
             WindowEvent::PinchGesture { delta, .. } => {
                 gpu.zoom *= 1.0 + delta as f32;
@@ -597,14 +794,13 @@ impl<T: Cell> ApplicationHandler for App<T> {
                     MouseScrollDelta::LineDelta(_, y) => {
                         gpu.zoom *= 1.1_f32.powf(y);
                         gpu.zoom = gpu.zoom.max(0.1);
-                        window.request_redraw();
                     }
                     MouseScrollDelta::PixelDelta(d) => {
                         gpu.camera[0] -= d.x as f32 / gpu.zoom;
                         gpu.camera[1] -= d.y as f32 / gpu.zoom;
-                        window.request_redraw();
                     }
                 }
+                window.request_redraw();
             }
             WindowEvent::MouseInput { button: MouseButton::Left, state, .. } => {
                 gpu.dragging = state == ElementState::Pressed;
@@ -624,7 +820,7 @@ impl<T: Cell> ApplicationHandler for App<T> {
                 if !gpu.paused {
                     for _ in 0..gpu.ticks_per_frame {
                         // Sync tick and apply pending replay events
-                        if gpu.param_count > 0 {
+                        {
                             let mut state = gpu.shared_params.lock().unwrap();
                             state.tick = gpu.tick;
                             match state.apply_pending_replay() {

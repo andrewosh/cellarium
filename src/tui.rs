@@ -27,6 +27,7 @@ pub struct ParamChange {
 pub struct ParamState {
     pub values: Vec<f32>,
     pub defaults: Vec<f32>,
+    pub starting_values: Vec<f32>,
     pub names: Vec<String>,
     pub selected: usize,
     pub title: String,
@@ -35,6 +36,7 @@ pub struct ParamState {
     pub history: Vec<ParamChange>,
     pub replay: Vec<ParamChange>,
     pub replay_cursor: usize,
+    pub status_msg: Option<String>,
 }
 
 pub enum ReplayAction {
@@ -48,9 +50,25 @@ pub const RESIZE_W_MARKER: &str = "__resize_w__";
 pub const RESIZE_H_MARKER: &str = "__resize_h__";
 
 impl ParamState {
+    pub fn adjust_param(&mut self, idx: usize, factor: f32) {
+        let val = self.values[idx];
+        let new_val = if val.abs() < 1e-7 {
+            // Additive step based on the default, so zero-valued params can be moved
+            let step = self.defaults[idx].abs().max(0.001) * (factor - 1.0);
+            if factor >= 1.0 { val + step } else { val - step }
+        } else {
+            if factor >= 1.0 { val * factor } else { val / (1.0 / factor) }
+        };
+        self.set_param(idx, new_val);
+    }
+
     pub fn set_param(&mut self, idx: usize, value: f32) {
         self.values[idx] = value;
-        if self.replay.is_empty() {
+        if !self.is_replaying() {
+            // If replay just finished, finalize it so we start fresh recording
+            if !self.replay.is_empty() {
+                self.finalize_replay();
+            }
             self.history.push(ParamChange {
                 tick: self.tick,
                 param: self.names[idx].clone(),
@@ -60,7 +78,10 @@ impl ParamState {
     }
 
     pub fn record_reset(&mut self) {
-        if self.replay.is_empty() {
+        if !self.is_replaying() {
+            if !self.replay.is_empty() {
+                self.finalize_replay();
+            }
             self.history.push(ParamChange {
                 tick: self.tick,
                 param: RESET_MARKER.to_string(),
@@ -70,7 +91,10 @@ impl ParamState {
     }
 
     pub fn record_resize(&mut self, width: u32, height: u32) {
-        if self.replay.is_empty() {
+        if !self.is_replaying() {
+            if !self.replay.is_empty() {
+                self.finalize_replay();
+            }
             self.history.push(ParamChange {
                 tick: self.tick,
                 param: RESIZE_W_MARKER.to_string(),
@@ -117,7 +141,15 @@ impl ParamState {
     }
 
     pub fn is_replaying(&self) -> bool {
-        !self.replay.is_empty()
+        !self.replay.is_empty() && self.replay_cursor < self.replay.len()
+    }
+
+    /// Call after replay finishes to snapshot current state and allow new recording.
+    pub fn finalize_replay(&mut self) {
+        self.starting_values = self.values.clone();
+        self.history.clear();
+        self.replay.clear();
+        self.replay_cursor = 0;
     }
 }
 
@@ -125,7 +157,7 @@ pub type SharedParams = Arc<Mutex<ParamState>>;
 
 pub fn save_params(state: &ParamState) -> io::Result<String> {
     let mut initial_entries: Vec<String> = Vec::new();
-    for (name, &val) in state.names.iter().zip(state.defaults.iter()) {
+    for (name, &val) in state.names.iter().zip(state.starting_values.iter()) {
         initial_entries.push(format!("    \"{}\": {}", name, val));
     }
     let initial = format!("{{\n{}\n  }}", initial_entries.join(",\n"));
@@ -157,10 +189,13 @@ pub fn load_params(state: &mut ParamState, path: &Path) -> io::Result<()> {
                     }
                 }
             }
+            // Snapshot loaded values as starting point
+            state.starting_values = state.values.clone();
 
             if let Some(serde_json::Value::Array(history)) = map.get("history") {
                 state.replay.clear();
                 state.replay_cursor = 0;
+                state.history.clear();
                 for entry in history {
                     if let (Some(tick), Some(param), Some(value)) = (
                         entry.get("tick").and_then(|t| t.as_u64()),
@@ -184,6 +219,7 @@ pub fn load_params(state: &mut ParamState, path: &Path) -> io::Result<()> {
                     }
                 }
             }
+            state.starting_values = state.values.clone();
         }
     }
     Ok(())
@@ -223,6 +259,7 @@ fn run_tui(shared: &SharedParams) -> io::Result<()> {
                     continue;
                 }
                 let mut state = shared.lock().unwrap();
+                state.status_msg = None;
                 if state.values.is_empty() {
                     if key.code == KeyCode::Char('q') || key.code == KeyCode::Esc {
                         state.running = false;
@@ -247,13 +284,11 @@ fn run_tui(shared: &SharedParams) -> io::Result<()> {
                     }
                     KeyCode::Left => {
                         let i = state.selected;
-                        let new_val = state.values[i] / factor as f32;
-                        state.set_param(i, new_val);
+                        state.adjust_param(i, 1.0 / factor as f32);
                     }
                     KeyCode::Right => {
                         let i = state.selected;
-                        let new_val = state.values[i] * factor as f32;
-                        state.set_param(i, new_val);
+                        state.adjust_param(i, factor as f32);
                     }
                     KeyCode::Char('d') => {
                         for i in 0..state.values.len() {
@@ -263,8 +298,8 @@ fn run_tui(shared: &SharedParams) -> io::Result<()> {
                     }
                     KeyCode::Char('s') => {
                         match save_params(&state) {
-                            Ok(path) => eprintln!("Saved to {}", path),
-                            Err(e) => eprintln!("Save failed: {}", e),
+                            Ok(path) => state.status_msg = Some(format!("Saved to {}", path)),
+                            Err(e) => state.status_msg = Some(format!("Save failed: {}", e)),
                         }
                     }
                     KeyCode::Char('q') | KeyCode::Esc => {
@@ -398,6 +433,13 @@ fn draw_ui(f: &mut ratatui::Frame, state: &ParamState) {
         help_spans.push(Span::styled(
             format!("[{} changes]", change_count),
             Style::default().fg(Color::DarkGray),
+        ));
+    }
+    if let Some(msg) = &state.status_msg {
+        help_spans.push(Span::raw("  "));
+        help_spans.push(Span::styled(
+            msg.clone(),
+            Style::default().fg(Color::Green),
         ));
     }
     let help = Line::from(help_spans);

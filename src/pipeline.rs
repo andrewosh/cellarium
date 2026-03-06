@@ -5,6 +5,7 @@ pub struct Pipelines {
     pub sim_bind_group_layout: BindGroupLayout,
     pub view_pipeline: RenderPipeline,
     pub view_bind_group_layout: BindGroupLayout,
+    pub screenshot_pipeline: RenderPipeline,
     pub init_pipeline: Option<RenderPipeline>,
     pub init_bind_group_layout: Option<BindGroupLayout>,
 }
@@ -47,6 +48,7 @@ pub fn create_pipelines(
         source: ShaderSource::Wgsl(view_shader_src.into()),
     });
     let view_pipeline = create_view_pipeline(device, &view_shader, &view_bind_group_layout, surface_format);
+    let screenshot_pipeline = create_view_pipeline(device, &view_shader, &view_bind_group_layout, TextureFormat::Rgba8Unorm);
 
     // Init pipeline (optional, stays as render pipeline)
     let (init_pipeline, init_bind_group_layout) = if let Some(init_src) = init_shader_src {
@@ -66,6 +68,7 @@ pub fn create_pipelines(
         sim_bind_group_layout,
         view_pipeline,
         view_bind_group_layout,
+        screenshot_pipeline,
         init_pipeline,
         init_bind_group_layout,
     }
